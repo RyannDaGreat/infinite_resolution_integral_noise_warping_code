@@ -15,7 +15,7 @@ Once taichi is installed, simply run:
 ```bash
 python test.py -n [exp_name]
 ```
-We assume that a folder `data/[exp_name]` exists and contains a file named `flows.npy` with a `[num_frames, H, W, 2]` array of flow map data. To get you started, we include three sample flow map sequences: `bear`, `lucia`, and `motorbike` along with the original videos from which they are extracted. 
+We assume that a folder `data/[exp_name]` exists and contains a file named `flows.npy` with a `[num_frames, H, W, 2]` array of flow map data. To get you started, we include three sample flow map sequences: `bear`, `lucia`, and `soapbox` along with the original videos from which they are extracted. 
 When testing on your own flow maps, please make sure to reshape it accordingly. We assume that the 2-vector `(r, c)` stored in each entry of the input array has conventions `r` going from top to bottom and `c` going from left to right.   
 
 We tested our code on `Windows 11` with `CUDA 11.8`, `Python 3.10.9`, and `Taichi 1.7.3`'.

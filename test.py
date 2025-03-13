@@ -22,10 +22,6 @@ n_frames, H, W, _ = flow_map.shape
 n_noise_channels = 4
 init_noise = np.random.randn(H, W, n_noise_channels)
 
-# NOTE align x-y conventions 
-flow_map = flow_map[...,[1,0]]
-flow_map[..., 1] *= -1
-
 logs_dir = os.path.join("logs", exp_name, exp_mode)
 os.makedirs(logs_dir, exist_ok=True)
 
@@ -50,7 +46,7 @@ results = [init_noise]
 prev_noise = init_noise
 for i, flow_map_i in enumerate(flow_map):
     print(f"Warping: {i}")
-    warper.set_deformation(identity_cc + flow_map_i)
+    warper.set_deformation(identity_cc - flow_map_i)
     warper.set_noise(prev_noise)
     warper.run()
     prev_noise = warper.noise_field.to_numpy()
