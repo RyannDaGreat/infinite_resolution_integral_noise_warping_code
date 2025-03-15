@@ -18,7 +18,7 @@ python test.py -n [exp_name]
 We assume that a folder `data/[exp_name]` exists and contains a file named `flows.npy` with a `[num_frames, H, W, 2]` array of flow map data. To get you started, we include three sample flow map sequences: `bear`, `lucia`, and `soapbox` along with the original videos from which they are extracted. 
 When testing on your own flow maps, please make sure to reshape it accordingly. We assume that the 2-vector `(r, c)` stored in each entry of the input array has conventions `r` going from top to bottom and `c` going from left to right.   
 
-We tested our code on `Windows 11` with `CUDA 11.8`, `Python 3.10.9`, and `Taichi 1.7.3`'.
+We tested our code on `Windows 11` with `CUDA 11.8`, `Python 3.10.9`, and `Taichi 1.7.3`.
 
 ## Output
 The warped noise will be saved as `warped_noise.npy` and a sequence of `.jpg` images for visualization in `logs/[exp_name]/particle`.
@@ -26,13 +26,12 @@ The warped noise will be saved as `warped_noise.npy` and a sequence of `.jpg` im
 ## Bibliography
 If you find our paper or code helpful, consider citing:
 ```
-@misc{deng2024infiniteresolutionintegralnoisewarping,
-      title={Infinite-Resolution Integral Noise Warping for Diffusion Models}, 
-      author={Yitong Deng and Winnie Lin and Lingxiao Li and Dmitriy Smirnov and Ryan Burgert and Ning Yu and Vincent Dedun and Mohammad H. Taghavi},
-      year={2024},
-      eprint={2411.01212},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2411.01212}, 
+@inproceedings{
+      deng2025infiniteresolution,
+      title={Infinite-Resolution Integral Noise Warping for Diffusion Models},
+      author={Yitong Deng and Winnie Lin and Lingxiao Li and Dmitriy Smirnov and Ryan D Burgert and Ning Yu and Vincent Dedun and Mohammad H. Taghavi},
+      booktitle={The Thirteenth International Conference on Learning Representations},
+      year={2025},
+      url={https://openreview.net/forum?id=Y6LPWBo2HP}
 }
 ```
