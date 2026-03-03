@@ -105,9 +105,17 @@ class ParticleWarper:
         #
         self.master_field = ti.field(ti.i32)
         self.area_field = ti.field(ti.f64)
-        max_entries = 10000 # max number that a cell is allowed to split into
         dense_size = 8
-        self.block = ti.root.pointer(ti.ijk, (math.ceil(im_height/dense_size), math.ceil(im_width/dense_size), math.ceil(max_entries/dense_size)))
+        max_entries = 10000 # max number that a cell is allowed to split into
+        dims = (math.ceil(im_height/dense_size), math.ceil(im_width/dense_size), math.ceil(max_entries/dense_size))
+        try:
+            self.block = ti.root.pointer(ti.ijk, dims)
+        except RuntimeError:
+            # Pointer SNodes unsupported (e.g. Metal). Dense fallback with reduced max_entries to fit in memory.
+            max_entries = 512
+            dims = (math.ceil(im_height/dense_size), math.ceil(im_width/dense_size), math.ceil(max_entries/dense_size))
+            print(f"Sparse SNodes not supported on this backend; using dense layout (max_entries={max_entries})")
+            self.block = ti.root.dense(ti.ijk, dims)
         self.pixel = self.block.dense(ti.ijk, (dense_size, dense_size, dense_size))
         self.pixel.place(self.master_field, self.area_field)
         # 

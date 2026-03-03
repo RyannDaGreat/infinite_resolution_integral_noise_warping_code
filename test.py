@@ -7,16 +7,24 @@ from warp_particle import *
 import argparse
 from PIL import Image
 
-ti.init(arch = ti.gpu, device_memory_GB=4.0, debug = False, default_fp=ti.f64, random_seed = 0)
-
 parser = argparse.ArgumentParser()
 parser.add_argument('-n', '--name', type=str, required=True, help='Name of experiment')
 parser.add_argument('-m', '--mode', type=str, help='Mode', default="particle")
+parser.add_argument('-f', '--frames', type=int, help='Max number of frames to process', default=None)
+parser.add_argument('--cpu', action='store_true', help='Use CPU backend (slower but portable)')
 args = parser.parse_args()
+
+if args.cpu:
+    ti.init(arch=ti.cpu, debug=False, default_fp=ti.f64, random_seed=0)
+else:
+    ti.init(arch=ti.gpu, device_memory_GB=4.0, debug=False, default_fp=ti.f64, random_seed=0)
+
 exp_name = args.name
 exp_mode = args.mode
 # load map
 flow_map = np.load(os.path.join("data", exp_name, "flows.npy")) # num_frames, H, W, 2
+if args.frames is not None:
+    flow_map = flow_map[:args.frames]
 print("Loaded flow map has shape: ", flow_map.shape)
 n_frames, H, W, _ = flow_map.shape
 n_noise_channels = 4
