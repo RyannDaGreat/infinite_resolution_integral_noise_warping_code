@@ -26,12 +26,15 @@ def ravel_index(s, t, n, m):
 
 # brownian bridge B(t) = W(t) - tW(1) + t * x
 # sample B(t2) | B(t1) = q
+# When t1 ≈ 1, the bridge is at its endpoint and B(1) = x deterministically.
+# Guard (1-t1) > eps to avoid division by zero in f32.
 @ti.func
 def sample_brownian_bridge(x, t1, t2, q):
-    sample = x # this is what happens when t2 >=1
-    if t2 < 1.:
-        mu = (1.-t2)/(1.-t1) * q + (t2-t1)/(1.-t1) * x
-        var = (t2-t1) * (1-t2) / (1-t1)
+    sample = x # B(1) = x (endpoint condition)
+    denom = 1. - t1
+    if t2 < 1. and denom > eps:
+        mu = (1.-t2)/denom * q + (t2-t1)/denom * x
+        var = (t2-t1) * (1-t2) / denom
         z = get_randn_like(x)
         sample = z * ti.math.sqrt(var) + mu
     return sample

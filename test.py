@@ -1,5 +1,6 @@
 import sys
 import os
+import platform
 code_path = os.path.join(os.path.dirname(__file__), 'src')
 # Add it to the system path
 sys.path.append(os.path.abspath(code_path))
@@ -14,10 +15,14 @@ parser.add_argument('-f', '--frames', type=int, help='Max number of frames to pr
 parser.add_argument('--cpu', action='store_true', help='Use CPU backend (slower but portable)')
 args = parser.parse_args()
 
-if args.cpu:
-    ti.init(arch=ti.cpu, debug=False, default_fp=ti.f64, random_seed=0)
+if args.cpu or platform.system() == 'Darwin':
+    # macOS: Taichi Metal backend has unreliable float atomics and no sparse SNodes.
+    # CPU with multithread is correct and fast on Apple Silicon.
+    fp = ti.f64
+    ti.init(arch=ti.cpu, debug=False, default_fp=fp, random_seed=0)
 else:
-    ti.init(arch=ti.gpu, device_memory_GB=4.0, debug=False, default_fp=ti.f64, random_seed=0)
+    fp = ti.f64
+    ti.init(arch=ti.gpu, device_memory_GB=4.0, debug=False, default_fp=fp, random_seed=0)
 
 exp_name = args.name
 exp_mode = args.mode
@@ -48,7 +53,7 @@ j = np.arange(W) + 0.5
 ii, jj = np.meshgrid(i, j, indexing='ij')
 identity_cc = np.stack((ii, jj), axis=-1)
 
-warper = ParticleWarper(H, W, n_noise_channels)
+warper = ParticleWarper(H, W, n_noise_channels, fp=fp)
 
 results = [init_noise]
 prev_noise = init_noise
