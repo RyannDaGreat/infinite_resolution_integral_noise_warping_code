@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Infinite Integral Noise Warping</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #111; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: monospace; color: #ccc; }
+        #canvas { border: 1px solid #333; cursor: crosshair; }
+        #stats { margin-top: 8px; font-size: 13px; color: #aaa; }
+        #controls { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; pointer-events: none; color: #fff8; font-size: 14px; line-height: 1.6; }
+        #error { color: #f44; margin-top: 16px; font-size: 14px; white-space: pre-wrap; max-width: 600px; }
+    </style>
+</head>
+<body>
+    <canvas id="canvas" width="512" height="512"></canvas>
+    <div id="stats">Loading...</div>
+    <div id="controls">
+        Click to capture mouse<br>
+        WASD — move | E/Q — up/down<br>
+        1-5 — display modes | ESC — release mouse
+    </div>
+    <div id="error"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/gl-matrix@3.4.3/gl-matrix-min.js"></script>
+    <script type="module" src="main.js"></script>
+</body>
+</html>
