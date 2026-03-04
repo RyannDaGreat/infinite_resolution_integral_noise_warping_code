@@ -500,22 +500,27 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
 export const blueNoiseBlurWGSL = /* wgsl */`
 struct Uniforms {
-    H:     u32,
-    W:     u32,
-    sigma: f32,
-    direction: u32,  // 0=horizontal, 1=vertical+subtract
+    H:           u32,
+    W:           u32,
+    sigma:       f32,
+    direction:   u32,  // 0=horizontal, 1=vertical+subtract+rescale
+    invSigmaHp:  f32,  // 1/σ_hp: rescales high-pass to unit variance
 }
 
 const RADIUS: i32 = 4;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read>       input:    array<f32>;
-@group(0) @binding(2) var<storage, read_write> output:   array<f32>;
-@group(0) @binding(3) var<storage, read>       original: array<f32>;
+@group(0) @binding(1) var<storage, read>       blurInput: array<f32>;  // source for blur samples
+@group(0) @binding(2) var<storage, read_write> noise:     array<f32>;  // dir=0: write temp; dir=1: read original + write result
 
-fn readVec4(buf: ptr<storage, array<f32>, read>, idx: u32) -> vec4f {
+fn readVec4Input(idx: u32) -> vec4f {
     let b = idx * 4u;
-    return vec4f((*buf)[b], (*buf)[b+1u], (*buf)[b+2u], (*buf)[b+3u]);
+    return vec4f(blurInput[b], blurInput[b+1u], blurInput[b+2u], blurInput[b+3u]);
+}
+
+fn readVec4Noise(idx: u32) -> vec4f {
+    let b = idx * 4u;
+    return vec4f(noise[b], noise[b+1u], noise[b+2u], noise[b+3u]);
 }
 
 @compute @workgroup_size(256)
@@ -540,157 +545,26 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             srcIdx = r * u.W + col;
         }
         let w = exp(-f32(d * d) * inv2s2);
-        sum += w * readVec4(&input, srcIdx);
+        sum += w * readVec4Input(srcIdx);
         wSum += w;
     }
 
     var result = sum / wSum;
 
-    // Vertical pass: high-pass = original - blurred
+    // Vertical pass: high-pass = (original - blurred) * invSigmaHp
+    // For Gaussian inputs, histogram matching is equivalent to dividing by σ_hp.
+    // Safe to read+write noise at same pixel: each thread touches only its own index.
     if (u.direction == 1u) {
-        result = readVec4(&original, idx) - result;
+        result = (readVec4Noise(idx) - result) * u.invSigmaHp;
     }
 
     let b = idx * 4u;
-    output[b]      = result.x;
-    output[b + 1u] = result.y;
-    output[b + 2u] = result.z;
-    output[b + 3u] = result.w;
+    noise[b]      = result.x;
+    noise[b + 1u] = result.y;
+    noise[b + 2u] = result.z;
+    noise[b + 3u] = result.w;
 }
 `;
 
-// ---------------------------------------------------------------------------
-// Histogram count: quantize values, atomicAdd histogram, store per-pixel slot
-// Processes all 4 channels per pixel in one thread.
-// ---------------------------------------------------------------------------
-
-export const blueNoiseHistCountWGSL = /* wgsl */`
-const NUM_BINS: u32 = 4096u;
-const RANGE_MIN: f32 = -6.0;
-const RANGE_SCALE: f32 = 341.333333;  // NUM_BINS / (6.0 - (-6.0)) = 4096/12
-
-struct Uniforms { H: u32, W: u32, }
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read>       values:    array<f32>;
-@group(0) @binding(2) var<storage, read_write> histogram: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> slots:     array<u32>;
-
-fn quantize(val: f32) -> u32 {
-    return clamp(u32(floor((val - RANGE_MIN) * RANGE_SCALE)), 0u, NUM_BINS - 1u);
-}
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-    let pixel = gid.x;
-    if (pixel >= u.H * u.W) { return; }
-    let base = pixel * 4u;
-
-    for (var c: u32 = 0u; c < 4u; c++) {
-        let bin = quantize(values[base + c]);
-        let slot = atomicAdd(&histogram[c * NUM_BINS + bin], 1u);
-        slots[base + c] = slot;
-    }
-}
-`;
-
-// ---------------------------------------------------------------------------
-// Prefix sum: exclusive scan on histogram (4 channels × 4096 bins)
-// One workgroup per channel, single-thread serial scan (4096 entries is tiny)
-// ---------------------------------------------------------------------------
-
-export const blueNoisePrefixSumWGSL = /* wgsl */`
-const NUM_BINS: u32 = 4096u;
-
-@group(0) @binding(0) var<storage, read_write> histogram: array<u32>;
-
-@compute @workgroup_size(1)
-fn main(@builtin(workgroup_id) wid: vec3u) {
-    let channel = wid.x;
-    let offset = channel * NUM_BINS;
-
-    var sum: u32 = 0u;
-    for (var i: u32 = 0u; i < NUM_BINS; i++) {
-        let val = histogram[offset + i];
-        histogram[offset + i] = sum;
-        sum += val;
-    }
-}
-`;
-
-// ---------------------------------------------------------------------------
-// Scatter sort: place noise values into sorted order using counting sort ranks
-// sortedTarget[c*N + rank] = values[pixel*4 + c]  (planar layout)
-// ---------------------------------------------------------------------------
-
-export const blueNoiseScatterSortWGSL = /* wgsl */`
-const NUM_BINS: u32 = 4096u;
-const RANGE_MIN: f32 = -6.0;
-const RANGE_SCALE: f32 = 341.333333;
-
-struct Uniforms { H: u32, W: u32, }
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read>       values:    array<f32>;
-@group(0) @binding(2) var<storage, read>       histogram: array<u32>;
-@group(0) @binding(3) var<storage, read>       slots:     array<u32>;
-@group(0) @binding(4) var<storage, read_write> sorted:    array<f32>;
-
-fn quantize(val: f32) -> u32 {
-    return clamp(u32(floor((val - RANGE_MIN) * RANGE_SCALE)), 0u, NUM_BINS - 1u);
-}
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-    let pixel = gid.x;
-    if (pixel >= u.H * u.W) { return; }
-    let N = u.H * u.W;
-    let base = pixel * 4u;
-
-    for (var c: u32 = 0u; c < 4u; c++) {
-        let val = values[base + c];
-        let bin = quantize(val);
-        let rank = histogram[c * NUM_BINS + bin] + slots[base + c];
-        sorted[c * N + rank] = val;
-    }
-}
-`;
-
-// ---------------------------------------------------------------------------
-// Scatter match: histogram matching — assign sorted target values by hp rank
-// output[pixel*4 + c] = sortedTarget[c*N + rank_in_hp]
-// ---------------------------------------------------------------------------
-
-export const blueNoiseScatterMatchWGSL = /* wgsl */`
-const NUM_BINS: u32 = 4096u;
-const RANGE_MIN: f32 = -6.0;
-const RANGE_SCALE: f32 = 341.333333;
-
-struct Uniforms { H: u32, W: u32, }
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read>       hpValues:  array<f32>;
-@group(0) @binding(2) var<storage, read>       histogram: array<u32>;
-@group(0) @binding(3) var<storage, read>       slots:     array<u32>;
-@group(0) @binding(4) var<storage, read>       sorted:    array<f32>;
-@group(0) @binding(5) var<storage, read_write> output:    array<f32>;
-
-fn quantize(val: f32) -> u32 {
-    return clamp(u32(floor((val - RANGE_MIN) * RANGE_SCALE)), 0u, NUM_BINS - 1u);
-}
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-    let pixel = gid.x;
-    if (pixel >= u.H * u.W) { return; }
-    let N = u.H * u.W;
-    let base = pixel * 4u;
-
-    for (var c: u32 = 0u; c < 4u; c++) {
-        let val = hpValues[base + c];
-        let bin = quantize(val);
-        let rank = histogram[c * NUM_BINS + bin] + slots[base + c];
-        output[base + c] = sorted[c * N + rank];
-    }
-}
-`;
+// Sorting shaders removed — replaced by analytical σ_hp rescaling in blur pass.
+// For Gaussian inputs, histogram matching is equivalent to dividing by σ_hp.

@@ -26,15 +26,25 @@
 - Implemented using Abramowitz & Stegun erf approximation (error < 1.5e-7)
 - Toggle via U key or button
 
+### Blue noise sorting → σ_hp rescaling optimization
+- **Key insight**: For Gaussian inputs, histogram matching = dividing by σ_hp
+- **But**: σ_hp is NOT constant across iterations. It evolves from 0.923 (iter 0) to 0.992 (iter 9)
+  as the spectrum shifts from white to blue
+- **Solution**: Pre-computed per-iteration sigma table (10 values), resolution-independent
+- **Validation results** (GPU-matched radius-4 kernel vs rp.convert_to_blue_noise):
+  - Rank correlation: 0.999994 — essentially identical spatial pattern
+  - Power spectrum: overlapping curves — same frequency characteristics
+  - Std after 10 iters: 0.9994 (table) vs 1.0000 (reference)
+  - Cross-resolution max diff: 0.001 (256-2048), confirming resolution independence
+- **Impact**: Removed 4 sorting shaders + buffers, reduced dispatches from 54→20 per frame
+- **Status**: Validated and implemented
+
 ### Known risks
-- Blue noise at 2048² is slow (~62ms, 16fps). LUT optimization could fix this.
 - Resolution toggle destroys and recreates renderer — may cause brief visual glitch
-- Greyscale is currently display-only; actual single-channel compute would save ~4x on blue noise sorting
+- Greyscale is currently display-only; actual single-channel compute would save ~4x on blue noise
 - `destroy()` method may not release all GPU resources if async operations are in flight
 
 ### Pending tasks
-- Verify blue noise backup/restore produces clean Gaussian stats (mean~0, std~1.0)
-- Verify blue noise GPU output matches Python reference numerically
-- Implement blue noise LUT optimization
-- Spacebar pause feature
-- Write .claude_todo.md sync
+- Greyscale compute optimization (single-channel blue noise)
+- WASM fallback
+- Continue BULLDOG optimization

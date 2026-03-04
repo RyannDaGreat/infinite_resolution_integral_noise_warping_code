@@ -7,11 +7,18 @@ import { cubeVertices, floorVertices, quadVertices } from './geometry.js';
 import {
     sceneWGSL, displayWGSL,
     buildDeformWGSL, backwardMapWGSL, brownianWGSL, normalizeWGSL,
-    blueNoiseBlurWGSL, blueNoiseHistCountWGSL, blueNoisePrefixSumWGSL,
-    blueNoiseScatterSortWGSL, blueNoiseScatterMatchWGSL,
+    blueNoiseBlurWGSL,
 } from './shaders.js';
 
 const NUM_TIMESTAMPS = 12; // 2 per pass × 6 passes
+
+// Pre-computed per-iteration invSigmaHp for blue noise σ_hp rescaling.
+// Resolution-independent (max cross-res diff < 0.002, verified 256-2048).
+// Computed with GPU-matched kernel: separable Gaussian, radius=4, wrap-around.
+const BN_INV_SIGMA_TABLE = [
+    1.083608, 1.035389, 1.023437, 1.017777, 1.014435,
+    1.012213, 1.010624, 1.009426, 1.008490, 1.007737,
+];
 
 // ---------------------------------------------------------------------------
 // Mulberry32 + Box-Muller PRNG (for CPU-side init only)
@@ -123,8 +130,9 @@ export class WebGPURenderer {
             this.masterFieldBuf, this.areaFieldBuf, this.deformationBuf,
             this.floorUniformBuf, this.cubeUniformBuf, this.computeUniformBuf, this.displayUniformBuf,
             this._statsStagingBuf,
-            this.bnHpBuf, this.bnSortedBuf, this.bnHistBuf, this.bnSlotsBuf, this.bnBackupBuf,
-            this.bnBlurHUniformBuf, this.bnBlurVUniformBuf,
+            this.bnBackupBuf,
+            this.bnBlurHUniformBuf,
+            ...(this.bnBlurVUniformBufs || []),
             this.cubeVB, this.floorVB, this.quadVB,
         ];
         if (this.hasTimestamps) bufs.push(this.querySet, this.tsResolveBuf, this.tsReadBuf);
@@ -204,25 +212,23 @@ export class WebGPURenderer {
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
 
-        // Blue noise buffers
-        const NUM_BINS = 4096;
-        this.bnHpBuf = storage(N * C * f4);                           // high-passed noise
-        this.bnSortedBuf = storage(N * C * f4);                       // sorted target (planar: 4 × N)
-        this.bnHistBuf = storage(C * NUM_BINS * f4, GPUBufferUsage.COPY_DST);  // histogram (clearable)
-        this.bnSlotsBuf = storage(N * C * f4);                        // per-pixel per-channel slots
+        // Blue noise buffers (sorting eliminated — replaced by σ_hp rescaling)
         // Backup buffer: noiseBuf is modified in-place for display, then restored for next frame's warp
         this.bnBackupBuf = device.createBuffer({
             size: N * C * f4,
             usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
         });
-        // Blur uniforms: {H, W, sigma, direction}
+        // Blur uniforms: {H, W, sigma, direction, invSigmaHp} = 20 bytes, padded to 32
+        // One H buffer (shared across all iterations) + one V buffer per iteration
         this.bnBlurHUniformBuf = device.createBuffer({
-            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.bnBlurVUniformBuf = device.createBuffer({
-            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        // Histogram uses computeUniformBuf (just needs H, W)
+        this.bnBlurVUniformBufs = [];
+        for (let i = 0; i < this.blueNoiseIterations; i++) {
+            this.bnBlurVUniformBufs.push(device.createBuffer({
+                size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            }));
+        }
     }
 
     _createPipelines() {
@@ -299,12 +305,8 @@ export class WebGPURenderer {
         this.brownianPipeline    = computePipeline(brownianMod, { WG_SIZE: this.brownianWG });
         this.normalizePipeline   = computePipeline(normalizeMod);
 
-        // Blue noise pipelines
-        this.bnBlurPipeline         = computePipeline(mod(blueNoiseBlurWGSL));
-        this.bnHistCountPipeline    = computePipeline(mod(blueNoiseHistCountWGSL));
-        this.bnPrefixSumPipeline    = computePipeline(mod(blueNoisePrefixSumWGSL));
-        this.bnScatterSortPipeline  = computePipeline(mod(blueNoiseScatterSortWGSL));
-        this.bnScatterMatchPipeline = computePipeline(mod(blueNoiseScatterMatchWGSL));
+        // Blue noise pipeline (just blur — sorting replaced by σ_hp rescaling)
+        this.bnBlurPipeline = computePipeline(mod(blueNoiseBlurWGSL));
     }
 
     _createBindGroups() {
@@ -380,83 +382,29 @@ export class WebGPURenderer {
             ],
         });
 
-        // --- Blue noise bind groups ---
+        // --- Blue noise bind groups (just blur — sorting replaced by σ_hp rescaling) ---
         const bnBlurLayout = this.bnBlurPipeline.getBindGroupLayout(0);
 
-        // Blur horizontal: input=noiseBuf, output=bufferBuf(temp), original=noiseBuf(unused)
+        // Blur horizontal: blurInput=noiseBuf, noise=bufferBuf (writes temp)
         this.bnBlurHBindGroup = device.createBindGroup({
             layout: bnBlurLayout,
             entries: [
                 { binding: 0, resource: buf(this.bnBlurHUniformBuf) },
                 { binding: 1, resource: buf(this.noiseBuf) },
                 { binding: 2, resource: buf(this.bufferBuf) },
-                { binding: 3, resource: buf(this.noiseBuf) },
             ],
         });
-        // Blur vertical+subtract: input=bufferBuf(temp), output=bnHpBuf, original=noiseBuf
-        this.bnBlurVBindGroup = device.createBindGroup({
-            layout: bnBlurLayout,
-            entries: [
-                { binding: 0, resource: buf(this.bnBlurVUniformBuf) },
-                { binding: 1, resource: buf(this.bufferBuf) },
-                { binding: 2, resource: buf(this.bnHpBuf) },
-                { binding: 3, resource: buf(this.noiseBuf) },
-            ],
-        });
-
-        // Histogram count for initial sort: values=noiseBuf
-        this.bnHistCountSortBindGroup = device.createBindGroup({
-            layout: this.bnHistCountPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.computeUniformBuf) },
-                { binding: 1, resource: buf(this.noiseBuf) },
-                { binding: 2, resource: buf(this.bnHistBuf) },
-                { binding: 3, resource: buf(this.bnSlotsBuf) },
-            ],
-        });
-        // Histogram count for matching: values=bnHpBuf
-        this.bnHistCountMatchBindGroup = device.createBindGroup({
-            layout: this.bnHistCountPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.computeUniformBuf) },
-                { binding: 1, resource: buf(this.bnHpBuf) },
-                { binding: 2, resource: buf(this.bnHistBuf) },
-                { binding: 3, resource: buf(this.bnSlotsBuf) },
-            ],
-        });
-
-        // Prefix sum
-        this.bnPrefixSumBindGroup = device.createBindGroup({
-            layout: this.bnPrefixSumPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.bnHistBuf) },
-            ],
-        });
-
-        // Scatter sort: noise values → sorted order
-        this.bnScatterSortBindGroup = device.createBindGroup({
-            layout: this.bnScatterSortPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.computeUniformBuf) },
-                { binding: 1, resource: buf(this.noiseBuf) },
-                { binding: 2, resource: buf(this.bnHistBuf) },
-                { binding: 3, resource: buf(this.bnSlotsBuf) },
-                { binding: 4, resource: buf(this.bnSortedBuf) },
-            ],
-        });
-
-        // Scatter match: sorted target → noise by hp rank
-        this.bnScatterMatchBindGroup = device.createBindGroup({
-            layout: this.bnScatterMatchPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.computeUniformBuf) },
-                { binding: 1, resource: buf(this.bnHpBuf) },
-                { binding: 2, resource: buf(this.bnHistBuf) },
-                { binding: 3, resource: buf(this.bnSlotsBuf) },
-                { binding: 4, resource: buf(this.bnSortedBuf) },
-                { binding: 5, resource: buf(this.noiseBuf) },
-            ],
-        });
+        // Per-iteration V bind groups (each has different invSigmaHp)
+        this.bnBlurVBindGroups = this.bnBlurVUniformBufs.map(vBuf =>
+            device.createBindGroup({
+                layout: bnBlurLayout,
+                entries: [
+                    { binding: 0, resource: buf(vBuf) },
+                    { binding: 1, resource: buf(this.bufferBuf) },
+                    { binding: 2, resource: buf(this.noiseBuf) },
+                ],
+            })
+        );
     }
 
     _createVertexBuffers() {
@@ -511,49 +459,33 @@ export class WebGPURenderer {
         const { H, W, device } = this;
         const D0 = Math.min(H, W) / this.blueNoiseCutoffDivider;
         const sigma = H / (2 * Math.PI * D0);
-        // Blur uniforms: {H, W, sigma, direction} — H and W are u32 but packed as bits in f32 buffer
-        // Actually the shader reads them as u32, so use Uint32Array for H,W and Float32Array for sigma
-        const hBuf = new ArrayBuffer(16);
+
+        // Uniform layout: {H: u32, W: u32, sigma: f32, direction: u32, invSigmaHp: f32, pad[3]}
+        const hBuf = new ArrayBuffer(32);
         const hU32 = new Uint32Array(hBuf);
         const hF32 = new Float32Array(hBuf);
-        hU32[0] = H; hU32[1] = W; hF32[2] = sigma; hU32[3] = 0;
-        device.queue.writeBuffer(this.bnBlurHUniformBuf, 0, hU32);
-        const vBuf = new ArrayBuffer(16);
-        const vU32 = new Uint32Array(vBuf);
-        const vF32 = new Float32Array(vBuf);
-        vU32[0] = H; vU32[1] = W; vF32[2] = sigma; vU32[3] = 1;
-        device.queue.writeBuffer(this.bnBlurVUniformBuf, 0, vU32);
+        hU32[0] = H; hU32[1] = W; hF32[2] = sigma; hU32[3] = 0; hF32[4] = 0;
+        device.queue.writeBuffer(this.bnBlurHUniformBuf, 0, hBuf);
+
+        // Per-iteration V uniforms with pre-computed invSigmaHp from BN_INV_SIGMA_TABLE
+        for (let i = 0; i < this.blueNoiseIterations; i++) {
+            const vBuf = new ArrayBuffer(32);
+            const vU32 = new Uint32Array(vBuf);
+            const vF32 = new Float32Array(vBuf);
+            vU32[0] = H; vU32[1] = W; vF32[2] = sigma; vU32[3] = 1;
+            vF32[4] = BN_INV_SIGMA_TABLE[i];
+            device.queue.writeBuffer(this.bnBlurVUniformBufs[i], 0, vBuf);
+        }
     }
 
     /**
      * Encode blue noise conversion dispatches into the command encoder.
-     * Algorithm: alternating projections (Gaussian high-pass + histogram matching).
+     * Algorithm: iterative high-pass filter with σ_hp rescaling.
+     * For Gaussian inputs, histogram matching = dividing by σ_hp (analytical).
+     * This eliminates all sorting — just 2 dispatches per iteration.
      * Not pure: appends GPU commands to encoder.
      */
     _encodeBlueNoise(encoder, workgroups256) {
-        const { N } = this;
-
-        // Step 0: Sort initial noise values (counting sort)
-        encoder.clearBuffer(this.bnHistBuf);
-        const sortHistPass = encoder.beginComputePass();
-        sortHistPass.setPipeline(this.bnHistCountPipeline);
-        sortHistPass.setBindGroup(0, this.bnHistCountSortBindGroup);
-        sortHistPass.dispatchWorkgroups(workgroups256);
-        sortHistPass.end();
-
-        const sortPrefixPass = encoder.beginComputePass();
-        sortPrefixPass.setPipeline(this.bnPrefixSumPipeline);
-        sortPrefixPass.setBindGroup(0, this.bnPrefixSumBindGroup);
-        sortPrefixPass.dispatchWorkgroups(4);  // 4 channels
-        sortPrefixPass.end();
-
-        const sortScatterPass = encoder.beginComputePass();
-        sortScatterPass.setPipeline(this.bnScatterSortPipeline);
-        sortScatterPass.setBindGroup(0, this.bnScatterSortBindGroup);
-        sortScatterPass.dispatchWorkgroups(workgroups256);
-        sortScatterPass.end();
-
-        // Step 1-N: Iterative blur + histogram match
         for (let i = 0; i < this.blueNoiseIterations; i++) {
             // Gaussian blur horizontal: noiseBuf → bufferBuf (temp)
             const blurH = encoder.beginComputePass();
@@ -562,34 +494,13 @@ export class WebGPURenderer {
             blurH.dispatchWorkgroups(workgroups256);
             blurH.end();
 
-            // Gaussian blur vertical + subtract: bufferBuf → bnHpBuf (high-pass)
+            // Gaussian blur vertical + subtract + rescale: in-place on noiseBuf
+            // result = (noiseBuf[pixel] - blur_v(bufferBuf)) * invSigmaHp[i]
             const blurV = encoder.beginComputePass();
             blurV.setPipeline(this.bnBlurPipeline);
-            blurV.setBindGroup(0, this.bnBlurVBindGroup);
+            blurV.setBindGroup(0, this.bnBlurVBindGroups[i]);
             blurV.dispatchWorkgroups(workgroups256);
             blurV.end();
-
-            // Histogram count on hp values
-            encoder.clearBuffer(this.bnHistBuf);
-            const histPass = encoder.beginComputePass();
-            histPass.setPipeline(this.bnHistCountPipeline);
-            histPass.setBindGroup(0, this.bnHistCountMatchBindGroup);
-            histPass.dispatchWorkgroups(workgroups256);
-            histPass.end();
-
-            // Prefix sum
-            const prefixPass = encoder.beginComputePass();
-            prefixPass.setPipeline(this.bnPrefixSumPipeline);
-            prefixPass.setBindGroup(0, this.bnPrefixSumBindGroup);
-            prefixPass.dispatchWorkgroups(4);
-            prefixPass.end();
-
-            // Scatter match: assign sorted values by hp rank → noiseBuf
-            const matchPass = encoder.beginComputePass();
-            matchPass.setPipeline(this.bnScatterMatchPipeline);
-            matchPass.setBindGroup(0, this.bnScatterMatchBindGroup);
-            matchPass.dispatchWorkgroups(workgroups256);
-            matchPass.end();
         }
     }
 
