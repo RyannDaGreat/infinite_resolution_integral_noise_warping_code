@@ -5,7 +5,7 @@ import numpy as np
 import glm
 from pathlib import Path
 
-from geometry import cube_vertices, quad_vertices
+from geometry import cube_vertices, floor_vertices, quad_vertices
 
 
 def load_shader(name):
@@ -71,6 +71,11 @@ class Renderer:
             self.scene_prog,
             [(cube_vbo, "3f 3f 3f", "in_position", "in_normal", "in_color")],
         )
+        floor_vbo = self.ctx.buffer(floor_vertices().tobytes())
+        self.floor_vao = self.ctx.vertex_array(
+            self.scene_prog,
+            [(floor_vbo, "3f 3f 3f", "in_position", "in_normal", "in_color")],
+        )
 
         quad_data = quad_vertices().tobytes()
         quad_vbo_nw = self.ctx.buffer(quad_data)
@@ -117,27 +122,35 @@ class Renderer:
         self.noise_tex[0].write(data)
         self.noise_tex[1].write(data)
 
-    def render_scene(self, model, view_proj, prev_model, prev_view_proj):
-        """
-        Render the cube to the MRT framebuffer (color + motion vectors).
-
-        Not pure: writes to scene_fbo GPU textures.
-
-        Args:
-            model (glm.mat4): Current model matrix.
-            view_proj (glm.mat4): Current view-projection matrix.
-            prev_model (glm.mat4): Previous frame's model matrix.
-            prev_view_proj (glm.mat4): Previous frame's view-projection matrix.
-        """
-        self.scene_fbo.use()
-        self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-
-        # PyGLM bytes() is row-major; OpenGL expects column-major → transpose
+    def _set_matrices(self, model, view_proj, prev_model, prev_view_proj):
+        """Write transposed matrices to scene shader uniforms."""
         self.scene_prog["u_model"].write(bytes(glm.transpose(model)))
         self.scene_prog["u_view_proj"].write(bytes(glm.transpose(view_proj)))
         self.scene_prog["u_prev_model"].write(bytes(glm.transpose(prev_model)))
         self.scene_prog["u_prev_view_proj"].write(bytes(glm.transpose(prev_view_proj)))
 
+    def render_scene(self, model, view_proj, prev_model, prev_view_proj):
+        """
+        Render cube + floor to the MRT framebuffer (color + motion vectors).
+
+        Not pure: writes to scene_fbo GPU textures.
+
+        Args:
+            model (glm.mat4): Current cube model matrix.
+            view_proj (glm.mat4): Current view-projection matrix.
+            prev_model (glm.mat4): Previous frame's cube model matrix.
+            prev_view_proj (glm.mat4): Previous frame's view-projection matrix.
+        """
+        self.scene_fbo.use()
+        self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+
+        # Floor (static — identity model, zero motion)
+        identity = glm.mat4(1.0)
+        self._set_matrices(identity, view_proj, identity, prev_view_proj)
+        self.floor_vao.render()
+
+        # Cube
+        self._set_matrices(model, view_proj, prev_model, prev_view_proj)
         self.cube_vao.render()
 
     def warp_noise(self):

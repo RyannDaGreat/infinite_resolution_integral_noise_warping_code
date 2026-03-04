@@ -95,8 +95,8 @@ class FPSCamera:
     Not pure: stores mutable position/rotation state.
     """
 
-    def __init__(self, position=None, yaw=-90.0, pitch=0.0):
-        self.position = glm.vec3(position or (0, 0, 3))
+    def __init__(self, position=None, yaw=-90.0, pitch=-10.0):
+        self.position = glm.vec3(position or (0, 1, 4))
         self.yaw = yaw
         self.pitch = pitch
         self.speed = 3.0
@@ -158,9 +158,9 @@ class SpinningCube:
     def __init__(self):
         self.angle = 0.0
         self.axis = glm.normalize(glm.vec3(1, 1, 0))
-        self.speed = 3.0
+        self.speed = 1.5
         self.target_axis = self._random_axis()
-        self.target_speed = np.random.uniform(1.5, 6.0)
+        self.target_speed = np.random.uniform(0.75, 3.0)
         self.change_timer = 0.0
         self.change_interval = 3.0
         self.prev_model = glm.mat4(1.0)
@@ -183,7 +183,7 @@ class SpinningCube:
         if self.change_timer > self.change_interval:
             self.change_timer = 0.0
             self.target_axis = self._random_axis()
-            self.target_speed = np.random.uniform(1.5, 6.0)
+            self.target_speed = np.random.uniform(0.75, 3.0)
             self.change_interval = np.random.uniform(2.0, 5.0)
 
     def model_matrix(self):
@@ -227,7 +227,7 @@ def run(width=200, height=150, fps=60, mode="glsl", image=None):
     )
 
     pygame.display.set_mode(
-        (width, height), pygame.OPENGL | pygame.DOUBLEBUF
+        (width, height), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
     )
     pygame.display.set_caption(f"Noise Warping Demo [{mode}]")
     clock = pygame.time.Clock()

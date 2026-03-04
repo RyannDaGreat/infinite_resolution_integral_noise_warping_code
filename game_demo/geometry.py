@@ -33,6 +33,40 @@ def cube_vertices():
     return np.array(verts, dtype=np.float32)
 
 
+def floor_vertices(y=-1.5, size=5.0):
+    """
+    Pure function. Returns a floor quad at height y, centered at origin.
+
+    Same vertex format as cube: (px, py, pz, nx, ny, nz, r, g, b).
+    Normal points up (+Y). Gray color.
+
+    Args:
+        y (float): Floor height. Default -1.5 (2 cube-heights below center).
+        size (float): Half-extent of floor quad.
+
+    Returns:
+        np.ndarray: Shape [6, 9] float32.
+
+    Examples:
+        >>> floor_vertices().shape
+        (6, 9)
+    """
+    n = np.array([0, 1, 0], dtype=np.float32)
+    c = np.array([0.35, 0.35, 0.4], dtype=np.float32)
+    s = size
+    # CCW winding when viewed from above (+Y) so front-face isn't culled
+    corners = [
+        np.array([-s, y, -s], dtype=np.float32),
+        np.array([-s, y,  s], dtype=np.float32),
+        np.array([ s, y,  s], dtype=np.float32),
+        np.array([ s, y, -s], dtype=np.float32),
+    ]
+    verts = []
+    for i in [0, 1, 2, 0, 2, 3]:
+        verts.append(np.concatenate([corners[i], n, c]))
+    return np.array(verts, dtype=np.float32)
+
+
 def quad_vertices():
     """
     Pure function. Returns fullscreen quad: two triangles covering [-1,1] clip space.
