@@ -48,3 +48,37 @@
 - Verified with 7 unit tests: translations ±X/±Y all match CPU predictions with 0.0000 relative error
 - Added `--mode image` for visual flow verification (warp a JPEG by motion vectors)
 - Default resolution reduced to 200x150 (1/4 of 800x600) for faster CPU regaussianize
+
+## 2026-03-04: Taichi performance optimization — 3.3x speedup
+
+### Profiling results (before optimization, 1920x1080)
+- Total: 152 ms/frame (7 fps)
+- Phase breakdown: Phase 1 (clear) 0.4%, Phase 2 (distribute) 3.6%, **Phase 3 (Brownian bridge) 95.4%**, Phase 4 (normalize) 0.5%
+- Bottleneck is Brownian bridge sampling: 8.3M iterations (4 tickets/pixel avg), each doing `ti.randn()` + `sqrt` + atomic scatter
+
+### Changes made to `rp/git/CommonSource/inf_int_noise_warp.py`
+1. **f32 precision** (`default_fp=ti.f32`, `fp=ti.f32`): All computation now f32 instead of f64. Halves memory bandwidth, faster FP ops. Output quality identical (mean~0, std~1).
+2. **Dense fixed-size ticket fields** (`_MAX_TICKETS=24`): Replaced SNode hierarchy (sparse pointer → dense, 512 entries/pixel) with simple `ti.field(shape=(H, W, 24))`. At 1080p: 198MB vs 8.5GB (43x less). Much better cache locality.
+3. **Bounds checks**: Phase 2 guards `if t < _MAX_TICKETS` on atomic_add. Phase 3 while loops check `k_idx < _MAX_TICKETS`. Max observed tickets = 15 (random flow), so 24 is safe.
+
+### Results (after optimization)
+| Resolution | Before | After | Speedup |
+|---|---|---|---|
+| 200x150 | 3.0 ms (336 fps) | 1.4 ms (692 fps) | 2.1x |
+| 800x600 | 36.9 ms (27 fps) | 13.4 ms (75 fps) | 2.8x |
+| 1280x720 | 69.0 ms (14 fps) | 18.9 ms (53 fps) | 3.7x |
+| 1920x1080 | 152.3 ms (7 fps) | 46.1 ms (22 fps) | 3.3x |
+
+### f16 tested and rejected
+- `ti.f16` with `ti.randn()` produces NaN — Taichi's RNG doesn't support f16
+- CPU backend emulates f16 via f32 conversion — no throughput gain (6.66ms vs 6.85ms for same kernel)
+- f16 is off the table on CPU backend
+
+### Other findings
+- `device_memory_GB=4` only affects CUDA GPU backend, irrelevant on macOS CPU
+- Taichi already uses all 14 M4 Pro cores (`cpu_max_num_threads=14`)
+- Remaining bottleneck is purely compute-bound: Brownian bridge RNG + atomic scatter, no further easy wins
+
+## 2026-03-04: Controls fix
+- Q remapped from quit to camera-down (Q=down, E=up, matching standard FPS controls)
+- ESC is now the only quit key

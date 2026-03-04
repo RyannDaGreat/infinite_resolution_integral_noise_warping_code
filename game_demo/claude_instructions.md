@@ -106,11 +106,12 @@ game_demo/
 PCG hash + Box-Muller transform. Seed per pixel per frame: `pixel_x * 7919 + pixel_y * 6271 + frame * 104729`.
 
 ## Controls
-- WASD / Space / Shift: Move camera
-- Mouse (click to capture): Look around
-- 1-4: Display modes (noise, color, motion, side-by-side)
-- Q / ESC: Quit
-- `--mode glsl` (default) or `--mode taichi`
+- WASD: Move camera horizontally
+- E / Space: Up, Q / Shift: Down
+- Mouse (click to capture, ESC to release): Look around
+- 1-5: Display modes (noise, color, motion, side-by-side, raw image)
+- ESC: Quit (also releases mouse)
+- `--mode glsl` (default), `--mode taichi`, or `--mode image`
 
 ## Key Decisions & Lessons Learned
 
@@ -142,6 +143,17 @@ PCG hash + Box-Muller transform. Seed per pixel per frame: `pixel_x * 7919 + pix
 ### Taichi on macOS
 - Must use CPU backend (Metal has unreliable float atomics, no sparse SNodes)
 - Imported from `rp.git.CommonSource.inf_int_noise_warp`
+- **f32 precision** (default_fp=ti.f32): 3x faster than f64, identical output quality
+- **f16 does NOT work**: `ti.randn()` produces NaN with f16 fields, and CPU backend emulates f16 via f32 conversion (no throughput gain). Off the table.
+- **Dense ticket fields** with `_MAX_TICKETS=24` instead of 512-entry SNodes: 43x less memory at 1080p (198MB vs 8.5GB), major cache improvement
+
+### Taichi performance (M4 Pro, CPU backend, f32)
+- 200x150: 1.4 ms (692 fps)
+- 800x600: 13.4 ms (75 fps)
+- 1280x720: 18.9 ms (53 fps)
+- 1920x1080: 46.1 ms (22 fps)
+- Bottleneck: Phase 3 (Brownian bridge sampling) = 95% of kernel time
+- 14 CPU threads used (all M4 Pro cores)
 
 ### Flow conventions
 - GPU motion vectors: (mv_x, mv_y) in UV space, row 0 = bottom (OpenGL), Y-up
