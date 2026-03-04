@@ -546,6 +546,10 @@ export class PhysicsWorld {
 
         // Signposts for all area entrances
         this.signposts = [];  // fixed: { body, half: [hx,hy,hz], color: [r,g,b,a] }
+
+        // Perimeter fence: render-only posts+rails + 4 invisible wall colliders
+        this.fence = [];       // render-only: { pos, rot, half, color }
+        this.fenceWalls = [];  // physics-only: fixed bodies
     }
 
     /**
@@ -564,6 +568,7 @@ export class PhysicsWorld {
         this._createPlatformTower();
         this._createForest();
         this._createSignposts();
+        this._createFence();
         this._createPlayer();
     }
 
@@ -575,6 +580,91 @@ export class PhysicsWorld {
             .setFriction(0.5)
             .setRestitution(0.1);
         this.world.createCollider(colDesc, this.floor);
+    }
+
+    /**
+     * Create white picket fence around the floor perimeter.
+     * 4 invisible wall colliders for physics + render-only posts and rails.
+     * Not pure: creates physics bodies and populates this.fence/this.fenceWalls.
+     */
+    _createFence() {
+        const HALF = FLOOR_HALF.x;  // 200 — floor is square
+        const FENCE_H = 0.75;       // fence half-height (1.5 units tall)
+        const POST_SPACING = 4;
+        const POST_HALF = [0.08, FENCE_H, 0.08];
+        const RAIL_THICK = 0.04;
+        const RAIL_HALF_H = 0.04;
+        const COLOR = [0.95, 0.93, 0.88, 1.0];
+        const IDENT_ROT = { x: 0, y: 0, z: 0, w: 1 };
+
+        // 4 invisible physics wall colliders (thin cuboids, 1.5m tall)
+        const walls = [
+            { pos: [0, FENCE_H, -HALF], half: [HALF, FENCE_H, 0.15] },  // north
+            { pos: [0, FENCE_H,  HALF], half: [HALF, FENCE_H, 0.15] },  // south
+            { pos: [ HALF, FENCE_H, 0], half: [0.15, FENCE_H, HALF] },  // east
+            { pos: [-HALF, FENCE_H, 0], half: [0.15, FENCE_H, HALF] },  // west
+        ];
+        for (const w of walls) {
+            const rb = this.world.createRigidBody(
+                RAPIER.RigidBodyDesc.fixed().setTranslation(...w.pos));
+            this.world.createCollider(
+                RAPIER.ColliderDesc.cuboid(...w.half).setFriction(0.3), rb);
+            this.fenceWalls.push(rb);
+        }
+
+        // Visual fence: posts every POST_SPACING along each edge + connecting rails
+        const addPost = (x, z) => {
+            this.fence.push({ pos: { x, y: FENCE_H, z }, rot: IDENT_ROT, half: POST_HALF, color: COLOR });
+        };
+
+        const addRail = (cx, cy, cz, hx, hy, hz) => {
+            this.fence.push({ pos: { x: cx, y: cy, z: cz }, rot: IDENT_ROT, half: [hx, hy, hz], color: COLOR });
+        };
+
+        // Rail Y positions: bottom rail at y=0.35, top rail at y=1.15
+        const railYBot = 0.35;
+        const railYTop = 1.15;
+        const railHalfSpan = POST_SPACING / 2;  // half the distance between posts
+
+        // North edge (z = -HALF): posts along x, rails along x
+        for (let x = -HALF; x <= HALF; x += POST_SPACING) {
+            addPost(x, -HALF);
+            if (x + POST_SPACING <= HALF) {
+                const cx = x + railHalfSpan;
+                addRail(cx, railYBot, -HALF, railHalfSpan, RAIL_HALF_H, RAIL_THICK);
+                addRail(cx, railYTop, -HALF, railHalfSpan, RAIL_HALF_H, RAIL_THICK);
+            }
+        }
+        // South edge (z = +HALF)
+        for (let x = -HALF; x <= HALF; x += POST_SPACING) {
+            addPost(x, HALF);
+            if (x + POST_SPACING <= HALF) {
+                const cx = x + railHalfSpan;
+                addRail(cx, railYBot, HALF, railHalfSpan, RAIL_HALF_H, RAIL_THICK);
+                addRail(cx, railYTop, HALF, railHalfSpan, RAIL_HALF_H, RAIL_THICK);
+            }
+        }
+        // East edge (x = +HALF): posts along z, rails along z (skip corners — already placed)
+        for (let z = -HALF + POST_SPACING; z < HALF; z += POST_SPACING) {
+            addPost(HALF, z);
+            if (z + POST_SPACING < HALF) {
+                const cz = z + railHalfSpan;
+                addRail(HALF, railYBot, cz, RAIL_THICK, RAIL_HALF_H, railHalfSpan);
+                addRail(HALF, railYTop, cz, RAIL_THICK, RAIL_HALF_H, railHalfSpan);
+            }
+        }
+        // West edge (x = -HALF)
+        for (let z = -HALF + POST_SPACING; z < HALF; z += POST_SPACING) {
+            addPost(-HALF, z);
+            if (z + POST_SPACING < HALF) {
+                const cz = z + railHalfSpan;
+                addRail(-HALF, railYBot, cz, RAIL_THICK, RAIL_HALF_H, railHalfSpan);
+                addRail(-HALF, railYTop, cz, RAIL_THICK, RAIL_HALF_H, railHalfSpan);
+            }
+        }
+
+        // Add final edge rails to connect the last posts to the corners on east/west
+        // (the loop skips the last section since z + POST_SPACING might overshoot)
     }
 
     _createDominoes(count) {
@@ -1529,6 +1619,7 @@ export class PhysicsWorld {
             shrubs: this.shrubs.map(extractBody),
             mushrooms: this.mushrooms.map(extractBody),
             signposts: this.signposts.map(extractBody),
+            fence: this.fence,  // render-only: { pos, rot, half, color }
         };
     }
 }

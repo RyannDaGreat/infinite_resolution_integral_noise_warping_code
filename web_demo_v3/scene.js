@@ -98,7 +98,7 @@ export class SceneManager {
             towerPlatforms, towerRamps, towerFlag,
             mmStructure, mmWheels, mmChains,
             terrainBlocks, trees, shrubs, mushrooms,
-            signposts,
+            signposts, fence,
         } = sceneData;
         let boxIdx = 0;
 
@@ -238,6 +238,15 @@ export class SceneManager {
                 const s = signposts[i];
                 const model = this._makeModel(s.pos, s.rot, s.half);
                 this._writeInstance(boxIdx++, model, `sign_${i}`, s.color);
+            }
+        }
+
+        // Perimeter fence (render-only: posts + rails)
+        if (fence) {
+            for (let i = 0; i < fence.length; i++) {
+                const f = fence[i];
+                const model = this._makeModel(f.pos, f.rot, f.half);
+                this._writeInstance(boxIdx++, model, `fence_${i}`, f.color);
             }
         }
 
