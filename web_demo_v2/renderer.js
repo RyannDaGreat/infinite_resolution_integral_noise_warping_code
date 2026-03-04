@@ -74,7 +74,13 @@ export class WebGPURenderer {
 
         this.hasTimestamps = adapter.features.has('timestamp-query');
         const features = this.hasTimestamps ? ['timestamp-query'] : [];
-        this.device = await adapter.requestDevice({ requiredFeatures: features });
+        this.device = await adapter.requestDevice({
+            requiredFeatures: features,
+            requiredLimits: {
+                maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+                maxBufferSize: adapter.limits.maxBufferSize,
+            },
+        });
         this.device.lost.then(info => { throw new Error('WebGPU device lost: ' + info.message); });
 
         // Canvas context

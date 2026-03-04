@@ -7,8 +7,8 @@ import { WebGPURenderer } from './renderer.js';
 
 const { mat4, vec3, glMatrix } = window.glMatrix;
 
-const WIDTH = 512;
-const HEIGHT = 512;
+const WIDTH = 2048;
+const HEIGHT = 2048;
 
 const MODE_NAMES = ['noise', 'color', 'motion', 'side-by-side', 'raw'];
 
@@ -126,6 +126,10 @@ async function main() {
     const canvas = document.getElementById('canvas');
     canvas.width = WIDTH;
     canvas.height = HEIGHT;
+    // Retina: render at full resolution, display at half CSS size
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.width = (WIDTH / dpr) + 'px';
+    canvas.style.height = (HEIGHT / dpr) + 'px';
 
     const statsEl = document.getElementById('stats');
     const controlsEl = document.getElementById('controls');
