@@ -505,6 +505,7 @@ struct Uniforms {
     sigma:       f32,
     direction:   u32,  // 0=horizontal, 1=vertical+subtract+rescale
     invSigmaHp:  f32,  // 1/σ_hp: rescales high-pass to unit variance
+    greyscale:   u32,  // 1=scalar path (channel 0 only), 0=vec4 path
 }
 
 const RADIUS: i32 = 4;
@@ -530,10 +531,36 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     let row = idx / u.W;
     let col = idx % u.W;
+    let inv2s2 = 1.0 / (2.0 * u.sigma * u.sigma);
 
+    // Greyscale scalar path: only process channel 0 (~75% less memory bandwidth)
+    if (u.greyscale == 1u) {
+        var sum1: f32 = 0.0;
+        var wSum1: f32 = 0.0;
+        for (var d: i32 = -RADIUS; d <= RADIUS; d++) {
+            var srcIdx: u32;
+            if (u.direction == 0u) {
+                let c = u32((i32(col) + d + i32(u.W)) % i32(u.W));
+                srcIdx = row * u.W + c;
+            } else {
+                let r = u32((i32(row) + d + i32(u.H)) % i32(u.H));
+                srcIdx = r * u.W + col;
+            }
+            let w = exp(-f32(d * d) * inv2s2);
+            sum1 += w * blurInput[srcIdx * 4u];
+            wSum1 += w;
+        }
+        var r1 = sum1 / wSum1;
+        if (u.direction == 1u) {
+            r1 = (noise[idx * 4u] - r1) * u.invSigmaHp;
+        }
+        noise[idx * 4u] = r1;
+        return;
+    }
+
+    // Vec4 path: process all 4 channels
     var sum = vec4f(0.0);
     var wSum: f32 = 0.0;
-    let inv2s2 = 1.0 / (2.0 * u.sigma * u.sigma);
 
     for (var d: i32 = -RADIUS; d <= RADIUS; d++) {
         var srcIdx: u32;

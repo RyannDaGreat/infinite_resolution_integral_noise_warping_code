@@ -459,12 +459,13 @@ export class WebGPURenderer {
         const { H, W, device } = this;
         const D0 = Math.min(H, W) / this.blueNoiseCutoffDivider;
         const sigma = H / (2 * Math.PI * D0);
+        const grey = this.greyscaleEnabled ? 1 : 0;
 
-        // Uniform layout: {H: u32, W: u32, sigma: f32, direction: u32, invSigmaHp: f32, pad[3]}
+        // Uniform layout: {H: u32, W: u32, sigma: f32, direction: u32, invSigmaHp: f32, greyscale: u32, pad[2]}
         const hBuf = new ArrayBuffer(32);
         const hU32 = new Uint32Array(hBuf);
         const hF32 = new Float32Array(hBuf);
-        hU32[0] = H; hU32[1] = W; hF32[2] = sigma; hU32[3] = 0; hF32[4] = 0;
+        hU32[0] = H; hU32[1] = W; hF32[2] = sigma; hU32[3] = 0; hF32[4] = 0; hU32[5] = grey;
         device.queue.writeBuffer(this.bnBlurHUniformBuf, 0, hBuf);
 
         // Per-iteration V uniforms with pre-computed invSigmaHp from BN_INV_SIGMA_TABLE
@@ -473,7 +474,7 @@ export class WebGPURenderer {
             const vU32 = new Uint32Array(vBuf);
             const vF32 = new Float32Array(vBuf);
             vU32[0] = H; vU32[1] = W; vF32[2] = sigma; vU32[3] = 1;
-            vF32[4] = BN_INV_SIGMA_TABLE[i];
+            vF32[4] = BN_INV_SIGMA_TABLE[i]; vU32[5] = grey;
             device.queue.writeBuffer(this.bnBlurVUniformBufs[i], 0, vBuf);
         }
     }
@@ -486,6 +487,13 @@ export class WebGPURenderer {
      * Not pure: appends GPU commands to encoder.
      */
     _encodeBlueNoise(encoder, workgroups256) {
+        // Update greyscale flag in blur uniforms (enables scalar path: 75% less bandwidth)
+        const greyFlag = new Uint32Array([this.greyscaleEnabled ? 1 : 0]);
+        this.device.queue.writeBuffer(this.bnBlurHUniformBuf, 20, greyFlag);
+        for (let i = 0; i < this.blueNoiseIterations; i++) {
+            this.device.queue.writeBuffer(this.bnBlurVUniformBufs[i], 20, greyFlag);
+        }
+
         for (let i = 0; i < this.blueNoiseIterations; i++) {
             // Gaussian blur horizontal: noiseBuf → bufferBuf (temp)
             const blurH = encoder.beginComputePass();
