@@ -224,7 +224,7 @@ export class WebGPURenderer {
             size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.bnBlurVUniformBufs = [];
-        for (let i = 0; i < this.blueNoiseIterations; i++) {
+        for (let i = 0; i < BN_INV_SIGMA_TABLE.length; i++) {
             this.bnBlurVUniformBufs.push(device.createBuffer({
                 size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             }));
@@ -469,7 +469,7 @@ export class WebGPURenderer {
         device.queue.writeBuffer(this.bnBlurHUniformBuf, 0, hBuf);
 
         // Per-iteration V uniforms with pre-computed invSigmaHp from BN_INV_SIGMA_TABLE
-        for (let i = 0; i < this.blueNoiseIterations; i++) {
+        for (let i = 0; i < BN_INV_SIGMA_TABLE.length; i++) {
             const vBuf = new ArrayBuffer(32);
             const vU32 = new Uint32Array(vBuf);
             const vF32 = new Float32Array(vBuf);
@@ -490,8 +490,8 @@ export class WebGPURenderer {
         // Update greyscale flag in blur uniforms (enables scalar path: 75% less bandwidth)
         const greyFlag = new Uint32Array([this.greyscaleEnabled ? 1 : 0]);
         this.device.queue.writeBuffer(this.bnBlurHUniformBuf, 20, greyFlag);
-        for (let i = 0; i < this.blueNoiseIterations; i++) {
-            this.device.queue.writeBuffer(this.bnBlurVUniformBufs[i], 20, greyFlag);
+        for (const vBuf of this.bnBlurVUniformBufs) {
+            this.device.queue.writeBuffer(vBuf, 20, greyFlag);
         }
 
         for (let i = 0; i < this.blueNoiseIterations; i++) {

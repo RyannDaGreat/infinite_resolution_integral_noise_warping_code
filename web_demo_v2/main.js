@@ -8,6 +8,7 @@ import { WebGPURenderer } from './renderer.js';
 const { mat4, vec3, glMatrix } = window.glMatrix;
 
 const RESOLUTIONS = [2048, 1024, 512, 256];
+const BN_ITERS_OPTIONS = [2, 5, 10];
 const MODE_NAMES = ['noise', 'color', 'motion', 'side-by-side', 'raw'];
 const STORAGE_KEY = 'iinw_v2_settings';
 
@@ -18,6 +19,7 @@ const STORAGE_KEY = 'iinw_v2_settings';
 const DEFAULTS = {
     resIdx: 0,
     blueNoise: false,
+    bnItersIdx: 2,  // index into BN_ITERS_OPTIONS (default: 10)
     greyscale: false,
     uniformDisplay: false,
     retina: true,
@@ -167,6 +169,8 @@ async function main() {
     let greyscaleOn = settings.greyscale;
     let uniformDisplayOn = settings.uniformDisplay;
     let blueNoiseOn = settings.blueNoise;
+    let bnItersIdx = settings.bnItersIdx;
+    let bnIters = BN_ITERS_OPTIONS[bnItersIdx];
     let renderer = null;
     let displayMode = 0;
     let frameSeed = 42;
@@ -174,6 +178,7 @@ async function main() {
     // --- UI elements ---
     const resBtn = document.getElementById('resBtn');
     const blueNoiseBtn = document.getElementById('blueNoiseBtn');
+    const bnItersBtn = document.getElementById('bnItersBtn');
     const greyBtn = document.getElementById('greyBtn');
     const uniformBtn = document.getElementById('uniformBtn');
     const retinaBtn = document.getElementById('retinaBtn');
@@ -185,6 +190,7 @@ async function main() {
         resBtn.textContent = W;
         blueNoiseBtn.textContent = `Blue Noise: ${blueNoiseOn ? 'ON' : 'OFF'}`;
         blueNoiseBtn.classList.toggle('on', blueNoiseOn);
+        bnItersBtn.textContent = `BN\u00d7${bnIters}`;
         greyBtn.textContent = `Grey: ${greyscaleOn ? 'ON' : 'OFF'}`;
         greyBtn.classList.toggle('on', greyscaleOn);
         uniformBtn.textContent = `Uniform: ${uniformDisplayOn ? 'ON' : 'OFF'}`;
@@ -197,8 +203,9 @@ async function main() {
 
     function persistSettings() {
         saveSettings({
-            resIdx, blueNoise: blueNoiseOn, greyscale: greyscaleOn,
-            uniformDisplay: uniformDisplayOn, retina: retinaOn, bilinear: bilinearOn,
+            resIdx, blueNoise: blueNoiseOn, bnItersIdx,
+            greyscale: greyscaleOn, uniformDisplay: uniformDisplayOn,
+            retina: retinaOn, bilinear: bilinearOn,
         });
     }
 
@@ -221,6 +228,7 @@ async function main() {
         renderer = new WebGPURenderer(canvas, W, H);
         renderer.brownianWGOverride = parseInt(params.get('brownian_wg')) || 256;
         renderer.blueNoiseEnabled = blueNoiseOn;
+        renderer.blueNoiseIterations = bnIters;
         renderer.greyscaleEnabled = greyscaleOn;
         renderer.uniformDisplayEnabled = uniformDisplayOn;
         await renderer.init();
@@ -261,6 +269,15 @@ async function main() {
         persistSettings();
     }
     blueNoiseBtn.addEventListener('click', toggleBlueNoise);
+
+    function cycleBnIters() {
+        bnItersIdx = (bnItersIdx + 1) % BN_ITERS_OPTIONS.length;
+        bnIters = BN_ITERS_OPTIONS[bnItersIdx];
+        renderer.blueNoiseIterations = bnIters;
+        bnItersBtn.textContent = `BN\u00d7${bnIters}`;
+        persistSettings();
+    }
+    bnItersBtn.addEventListener('click', cycleBnIters);
 
     function toggleGreyscale() {
         greyscaleOn = !greyscaleOn;
@@ -303,6 +320,7 @@ async function main() {
         const d = DEFAULTS;
         resIdx = d.resIdx; W = RESOLUTIONS[resIdx]; H = W;
         blueNoiseOn = d.blueNoise;
+        bnItersIdx = d.bnItersIdx; bnIters = BN_ITERS_OPTIONS[bnItersIdx];
         greyscaleOn = d.greyscale;
         uniformDisplayOn = d.uniformDisplay;
         retinaOn = d.retina;
@@ -346,6 +364,7 @@ async function main() {
             document.exitPointerLock();
         }
         if (e.code === 'KeyB') toggleBlueNoise();
+        if (e.code === 'KeyN') cycleBnIters();
         if (e.code === 'KeyG') toggleGreyscale();
         if (e.code === 'KeyU') toggleUniformDisplay();
         if (e.code === 'KeyR' && !mouseCaptured) cycleResolution();

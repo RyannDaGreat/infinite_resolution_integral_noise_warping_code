@@ -56,6 +56,7 @@
         <span class="sep">|</span>
         <button id="resBtn" title="Cycle render resolution: 2048, 1024, 512, 256 (hotkey: R)">2048</button>
         <button id="blueNoiseBtn" title="Toggle blue noise post-processing (hotkey: B)">Blue Noise: OFF</button>
+        <button id="bnItersBtn" title="Cycle blue noise iterations: 2, 5, 10 (hotkey: N). Fewer = faster, less blue.">BN×10</button>
         <button id="greyBtn" title="Toggle greyscale display — show channel 0 only (hotkey: G)">Grey: OFF</button>
         <button id="uniformBtn" title="Toggle Gaussian→Uniform display mapping via normal CDF (hotkey: U)">Uniform: OFF</button>
         <button id="retinaBtn" title="Toggle retina/HiDPI scaling (hotkey: T)">Retina: ON</button>
@@ -72,7 +73,7 @@
             1-5 — display modes | ESC — release mouse<br>
             Space — pause
         </div>
-        <div id="hint" class="overlay">ESC release | 1-5 modes | B blue | G grey | U uniform | R res | T retina | I interp | Space pause</div>
+        <div id="hint" class="overlay">ESC release | 1-5 modes | B blue | N iters | G grey | U uniform | R res | T retina | I interp | Space pause</div>
     </div>
     <div id="error"></div>
 
