@@ -121,9 +121,9 @@ class FPSCamera:
             self.position -= right * v
         if keys[pygame.K_d]:
             self.position += right * v
-        if keys[pygame.K_SPACE]:
+        if keys[pygame.K_e] or keys[pygame.K_SPACE]:
             self.position.y += v
-        if keys[pygame.K_LSHIFT]:
+        if keys[pygame.K_q] or keys[pygame.K_LSHIFT]:
             self.position.y -= v
 
     def _forward(self):
@@ -272,8 +272,6 @@ def run(width=200, height=150, fps=60, mode="glsl", image=None):
                         mouse_captured = False
                     else:
                         running = False
-                elif event.key == pygame.K_q:
-                    running = False
                 elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5):
                     display_mode = event.key - pygame.K_1
             elif event.type == pygame.MOUSEBUTTONDOWN and not mouse_captured:

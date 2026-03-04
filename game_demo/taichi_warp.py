@@ -3,6 +3,8 @@ Taichi GWTF wrapper for GPU motion vector integration.
 
 Runs the real particle-based GWTF algorithm on CPU, reading motion vectors
 from the GPU scene pass and uploading results back to a GPU noise texture.
+
+Pre-allocates all numpy buffers to avoid per-frame allocation overhead.
 """
 
 import numpy as np
@@ -13,6 +15,7 @@ class TaichiWarper:
     Wraps the Taichi-based GWTF warp for use with GPU-generated motion vectors.
 
     Not pure: allocates Taichi fields, mutates internal state each frame.
+    Pre-allocates reusable numpy buffers for zero-allocation per-frame path.
 
     Args:
         width (int): Framebuffer width.
@@ -35,6 +38,10 @@ class TaichiWarper:
         # Initial noise in image coordinates (row 0 = top)
         self.prev_noise = np.random.randn(height, width, channels)
 
+        # Pre-allocate reusable buffers
+        self._deformation = np.empty((height, width, 2), dtype=np.float64)
+        self._gpu_result = np.empty((height, width, channels), dtype=np.float32)
+
     def get_init_noise_for_gpu(self):
         """
         Return initial noise flipped for OpenGL upload (row 0 = bottom).
@@ -51,7 +58,7 @@ class TaichiWarper:
         """
         Run one GWTF warp step using GPU motion vectors.
 
-        Not pure: mutates internal warper state.
+        Not pure: mutates internal warper state and pre-allocated buffers.
 
         Args:
             motion_gpu (np.ndarray): [H, W, 2] motion vectors from GPU in
@@ -66,20 +73,29 @@ class TaichiWarper:
         Examples:
             >>> # result = tw.step(motion_from_gpu)
         """
-        from rp.git.CommonSource.inf_int_noise_warp import _warp_step
+        H, W = self.height, self.width
+        deform = self._deformation
 
-        # Convert GPU motion vectors to Taichi flow format:
-        # GPU: row 0 = bottom, UV space, Y-up
-        # Taichi: row 0 = top, pixel space, (dx, dy) where dy is positive-down
-        motion_img = np.flipud(motion_gpu)  # row 0 = top (image coords)
+        # Build deformation map in-place: identity_cc - flow_rc
+        # GPU motion: (mv_x, mv_y) UV space, row 0 = bottom, Y-up
+        # Taichi: (row, col) pixel space, row 0 = top
+        # flow_rc = (dy_pixels, dx_pixels) where dy = -mv_y * H, dx = mv_x * W
+        # deform = identity_cc - flow_rc
+        motion_flipped = motion_gpu[::-1]  # view, no copy — flipud
+        # row component: identity_row - (-mv_y * H) = identity_row + mv_y * H
+        np.multiply(motion_flipped[:, :, 1], H, out=deform[:, :, 0])
+        deform[:, :, 0] += self.identity_cc[:, :, 0]
+        # col component: identity_col - (mv_x * W) = identity_col - mv_x * W
+        np.multiply(motion_flipped[:, :, 0], -W, out=deform[:, :, 1])
+        deform[:, :, 1] += self.identity_cc[:, :, 1]
 
-        flow_dx = motion_img[:, :, 0] * self.width   # UV → pixels, horizontal
-        flow_dy = -motion_img[:, :, 1] * self.height  # UV → pixels, flip Y
-        flow_dxdy = np.stack([flow_dx, flow_dy], axis=-1)
+        # Run Taichi kernel (inlined from _warp_step to avoid extra copies)
+        self.warper.set_deformation(deform)
+        self.warper.set_noise(self.prev_noise)
+        self.warper.run()
+        self.prev_noise = self.warper.noise_field.to_numpy()
 
-        self.prev_noise = _warp_step(
-            self.warper, self.identity_cc, self.prev_noise, flow_dxdy
-        )
+        # Flip result to OpenGL order (row 0 = bottom) into pre-allocated buffer
+        np.copyto(self._gpu_result, self.prev_noise[::-1], casting="same_kind")
 
-        # Flip back to OpenGL order for GPU upload
-        return np.flipud(self.prev_noise).astype(np.float32)
+        return self._gpu_result
