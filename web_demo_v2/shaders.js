@@ -232,12 +232,12 @@ struct Uniforms {
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read>       ticketCount:     array<i32>;
-@group(0) @binding(2) var<storage, read>       masterField:     array<i32>;
-@group(0) @binding(3) var<storage, read>       areaField:       array<f32>;
-@group(0) @binding(4) var<storage, read>       noise:           array<f32>;
-@group(0) @binding(5) var<storage, read_write> bufferAtomic:    array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> pixelAreaAtomic: array<atomic<u32>>;
+@group(0) @binding(1) var<storage, read>       ticketCount:    array<i32>;
+@group(0) @binding(2) var<storage, read>       masterField:    array<i32>;
+@group(0) @binding(3) var<storage, read>       areaField:      array<f32>;
+@group(0) @binding(4) var<storage, read>       noise:          array<f32>;
+@group(0) @binding(5) var<storage, read_write> bufferAtomic:   array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> totalRequest:   array<f32>;
 
 fn pcg(v: u32) -> u32 {
     var state = v * 747796405u + 2891336453u;
@@ -289,24 +289,38 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (nTickets <= 0) { return; }
 
     let ticketBase = srcIdx * MAX_TICKETS;
-    var totalRequest: f32 = 0.0;
+    var totalReq: f32 = 0.0;
     for (var k: i32 = 0; k < nTickets; k = k + 1) {
-        totalRequest += areaField[ticketBase + u32(k)];
+        totalReq += areaField[ticketBase + u32(k)];
     }
-    if (totalRequest <= 0.0) { return; }
+    if (totalReq <= 0.0) { return; }
+
+    // Store per-source totalRequest so normalize can compute pixelArea without atomics
+    totalRequest[srcIdx] = totalReq;
+
+    let srcBase = srcIdx * 4u;
+    let srcNoise = vec4f(noise[srcBase], noise[srcBase+1u], noise[srcBase+2u], noise[srcBase+3u]);
+
+    // Fast path: 1 ticket = direct copy, no Brownian bridge / randn needed
+    if (nTickets == 1) {
+        let destIdx = u32(masterField[ticketBase]);
+        let destBase = destIdx * 4u;
+        atomicAddF32(&bufferAtomic[destBase],      srcNoise.x);
+        atomicAddF32(&bufferAtomic[destBase + 1u], srcNoise.y);
+        atomicAddF32(&bufferAtomic[destBase + 2u], srcNoise.z);
+        atomicAddF32(&bufferAtomic[destBase + 3u], srcNoise.w);
+        return;
+    }
 
     // Vectorized Brownian bridge — operate on all 4 channels as vec4f
     var pastRange: f32 = 0.0;
     var pv = vec4f(0.0);  // pastValue for all 4 channels
     var randState: u32 = pcg(u.frameSeed * 104729u + srcIdx);
 
-    let srcBase = srcIdx * 4u;
-    let srcNoise = vec4f(noise[srcBase], noise[srcBase+1u], noise[srcBase+2u], noise[srcBase+3u]);
-
     for (var k: i32 = 0; k < nTickets; k = k + 1) {
         let w = areaField[ticketBase + u32(k)];
         let destIdx = u32(masterField[ticketBase + u32(k)]);
-        let normalizedW = w / totalRequest;
+        let normalizedW = w / totalReq;
         let nextRange = pastRange + normalizedW;
 
         var nv: vec4f;  // nextValue
@@ -332,7 +346,6 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         atomicAddF32(&bufferAtomic[destBase + 2u], cv.z);
         atomicAddF32(&bufferAtomic[destBase + 3u], cv.w);
 
-        atomicAddF32(&pixelAreaAtomic[destIdx], normalizedW);
         pv = nv;
         pastRange = nextRange;
     }
@@ -354,9 +367,10 @@ struct Uniforms {
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read>       buffer:    array<f32>;
-@group(0) @binding(2) var<storage, read>       pixelArea: array<f32>;
-@group(0) @binding(3) var<storage, read_write> noise:     array<f32>;
+@group(0) @binding(1) var<storage, read>       buffer:       array<f32>;
+@group(0) @binding(2) var<storage, read>       deformation:  array<f32>;
+@group(0) @binding(3) var<storage, read>       totalRequest: array<f32>;
+@group(0) @binding(4) var<storage, read_write> noise:        array<f32>;
 
 // PCG hash for PRNG
 fn pcg(v: u32) -> u32 {
@@ -373,12 +387,52 @@ fn randn(seed: u32) -> f32 {
     return sqrt(-2.0 * log(u1)) * cos(6.283185307 * u2);
 }
 
+// Compute pixelArea for dest pixel by recomputing bilinear weights from deformation
+// and reading totalRequest per source pixel. Avoids atomic scatter in brownian pass.
+fn computePixelArea(idx: u32) -> f32 {
+    let wpRow = deformation[idx * 2u] - 0.5;
+    let wpCol = deformation[idx * 2u + 1u] - 0.5;
+    let lRow = i32(floor(wpRow));
+    let lCol = i32(floor(wpCol));
+    let fRow = wpRow - f32(lRow);
+    let fCol = wpCol - f32(lCol);
+
+    var area: f32 = 0.0;
+    let w00 = (1.0 - fRow) * (1.0 - fCol);
+    let w11 = fRow * fCol;
+    let w01 = (1.0 - fRow) * fCol;
+    let w10 = fRow * (1.0 - fCol);
+
+    // For each bilinear neighbor: area += weight / totalRequest[neighbor]
+    // (only if neighbor is in bounds and has nonzero totalRequest)
+    let uRow = lRow + 1;
+    let uCol = lCol + 1;
+
+    if (lRow >= 0 && lRow < i32(u.H) && lCol >= 0 && lCol < i32(u.W) && w00 > 0.0) {
+        let tr = totalRequest[u32(lRow) * u.W + u32(lCol)];
+        if (tr > 0.0) { area += w00 / tr; }
+    }
+    if (uRow >= 0 && uRow < i32(u.H) && uCol >= 0 && uCol < i32(u.W) && w11 > 0.0) {
+        let tr = totalRequest[u32(uRow) * u.W + u32(uCol)];
+        if (tr > 0.0) { area += w11 / tr; }
+    }
+    if (lRow >= 0 && lRow < i32(u.H) && uCol >= 0 && uCol < i32(u.W) && w01 > 0.0) {
+        let tr = totalRequest[u32(lRow) * u.W + u32(uCol)];
+        if (tr > 0.0) { area += w01 / tr; }
+    }
+    if (uRow >= 0 && uRow < i32(u.H) && lCol >= 0 && lCol < i32(u.W) && w10 > 0.0) {
+        let tr = totalRequest[u32(uRow) * u.W + u32(lCol)];
+        if (tr > 0.0) { area += w10 / tr; }
+    }
+    return area;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let idx = gid.x;
     if (idx >= u.H * u.W) { return; }
 
-    let area = pixelArea[idx];
+    let area = computePixelArea(idx);
     let base = idx * C;
 
     if (area > 0.0) {

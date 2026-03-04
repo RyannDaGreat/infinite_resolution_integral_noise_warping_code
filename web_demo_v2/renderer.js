@@ -129,9 +129,9 @@ export class WebGPURenderer {
         this.noiseBuf = storage(N * C * f4, GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
 
         // Intermediate compute buffers (cleared each frame)
-        this.bufferBuf     = storage(N * C * f4, GPUBufferUsage.COPY_DST);
-        this.pixelAreaBuf  = storage(N * f4, GPUBufferUsage.COPY_DST);
-        this.ticketCountBuf = storage(N * f4, GPUBufferUsage.COPY_DST);
+        this.bufferBuf       = storage(N * C * f4, GPUBufferUsage.COPY_DST);
+        this.totalRequestBuf = storage(N * f4, GPUBufferUsage.COPY_DST);
+        this.ticketCountBuf  = storage(N * f4, GPUBufferUsage.COPY_DST);
 
         // Ticket data (not cleared — only valid entries read)
         this.masterFieldBuf = storage(N * MAX_TICKETS * f4);
@@ -295,18 +295,19 @@ export class WebGPURenderer {
                 { binding: 3, resource: buf(this.areaFieldBuf) },
                 { binding: 4, resource: buf(this.noiseBuf) },
                 { binding: 5, resource: buf(this.bufferBuf) },
-                { binding: 6, resource: buf(this.pixelAreaBuf) },
+                { binding: 6, resource: buf(this.totalRequestBuf) },
             ],
         });
 
-        // Normalize bind group
+        // Normalize bind group — computes pixelArea from deformation + totalRequest
         this.normalizeBindGroup = device.createBindGroup({
             layout: this.normalizePipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: buf(this.computeUniformBuf) },
                 { binding: 1, resource: buf(this.bufferBuf) },
-                { binding: 2, resource: buf(this.pixelAreaBuf) },
-                { binding: 3, resource: buf(this.noiseBuf) },
+                { binding: 2, resource: buf(this.deformationBuf) },
+                { binding: 3, resource: buf(this.totalRequestBuf) },
+                { binding: 4, resource: buf(this.noiseBuf) },
             ],
         });
     }
@@ -460,7 +461,7 @@ export class WebGPURenderer {
 
         // --- Clear intermediate buffers ---
         encoder.clearBuffer(this.bufferBuf);
-        encoder.clearBuffer(this.pixelAreaBuf);
+        encoder.clearBuffer(this.totalRequestBuf);
         encoder.clearBuffer(this.ticketCountBuf);
 
         // --- Pass 2: Backward map (compute) ---
