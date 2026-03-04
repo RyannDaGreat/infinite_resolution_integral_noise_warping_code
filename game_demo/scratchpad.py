@@ -1,134 +1,107 @@
-"""Full test suite: motion vectors + GLSL + Taichi end-to-end."""
+# Validate noise functions produce reasonable terrain
 
-import os
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+import math
 
-import pygame
-import numpy as np
-import glm
+FOREST_CENTER_X = 0
+FOREST_CENTER_Z = 200
+FOREST_HALF_EXTENT = 75
+FOREST_AMPLITUDE = 40
+FOREST_FREQ = 0.025
+FOREST_SEED = 31337
+FOREST_GRID_SPACING = 2.0
 
-pygame.init()
-pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 4)
-pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
-pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
-pygame.display.gl_set_attribute(pygame.GL_CONTEXT_FORWARD_COMPATIBLE_FLAG, True)
-W, H = 200, 150
-pygame.display.set_mode((W, H), pygame.OPENGL | pygame.DOUBLEBUF)
+def hashCell(a, b, seed):
+    # Wang hash, matching the JS int32 math
+    a = int(a)
+    b = int(b)
+    seed = int(seed)
+    # Use Python's arbitrary precision but mask to 32 bits like JS
+    s = (seed ^ (a * 1619 + b * 31337)) & 0xFFFFFFFF
+    s = (s ^ (s >> 16)) * 0x45d9f3b & 0xFFFFFFFF
+    s = (s ^ (s >> 16)) * 0x45d9f3b & 0xFFFFFFFF
+    s = (s ^ (s >> 16)) & 0xFFFFFFFF
+    return s / 0xFFFFFFFF
 
-from renderer import Renderer
-from regaussianize import regaussianize
+def valueNoise2D(x, z, seed):
+    ix, iz = math.floor(x), math.floor(z)
+    fx, fz = x - ix, z - iz
+    ux = fx * fx * (3 - 2 * fx)
+    uz = fz * fz * (3 - 2 * fz)
+    v00 = hashCell(ix,     iz,     seed)
+    v10 = hashCell(ix + 1, iz,     seed)
+    v01 = hashCell(ix,     iz + 1, seed)
+    v11 = hashCell(ix + 1, iz + 1, seed)
+    return v00 + ux * (v10 - v00) + uz * (v01 - v00) + ux * uz * (v00 - v10 - v01 + v11)
 
-identity = glm.mat4(1.0)
+def fbm2D(x, z, seed, octaves=6, lacunarity=2.0, gain=0.5):
+    value = 0
+    amplitude = 1.0
+    totalAmp = 0
+    freq = 1.0
+    for i in range(octaves):
+        value += amplitude * valueNoise2D(x * freq, z * freq, seed + i * 7919)
+        totalAmp += amplitude
+        amplitude *= gain
+        freq *= lacunarity
+    return value / totalAmp
 
+def terrainHeight(wx, wz):
+    lx = wx - FOREST_CENTER_X
+    lz = wz - FOREST_CENTER_Z
+    raw = fbm2D(lx * FOREST_FREQ, lz * FOREST_FREQ, FOREST_SEED)
+    shaped = raw ** 1.4
+    h = shaped * FOREST_AMPLITUDE
+    edgeFadeX = max(0, 1 - abs(lx) / (FOREST_HALF_EXTENT * 0.85))
+    edgeFadeZ = max(0, 1 - max(0, -lz) / 40)
+    fade = min(edgeFadeX, edgeFadeZ) ** 1.5
+    return h * fade
 
-def cpu_motion(point, model, prev_model, vp):
-    p = glm.vec4(*point, 1.0)
-    cc = vp * model * p
-    pc = vp * prev_model * p
-    cn = glm.vec2(cc.x / cc.w, cc.y / cc.w)
-    pn = glm.vec2(pc.x / pc.w, pc.y / pc.w)
-    d = (cn - pn) * 0.5
-    return float(d.x), float(d.y)
-
-
-def center_motion(mv, W, H):
-    cy, cx = H // 2, W // 2
-    patch = mv[cy - 3:cy + 3, cx - 3:cx + 3]
-    mask = np.any(np.abs(patch) > 1e-6, axis=-1)
-    if mask.sum() < 3:
-        return None
-    return patch[mask].mean(axis=0)
-
-
-# === Motion vector tests ===
-print("=== Motion Vector Tests ===\n")
-renderer = Renderer(W, H)
-proj = glm.perspective(glm.radians(60.0), W / H, 0.1, 100.0)
-view = glm.lookAt(glm.vec3(0, 0, 3), glm.vec3(0, 0, 0), glm.vec3(0, 1, 0))
-vp = proj * view
-
-tests = [
-    ("No motion", identity, identity, "zero"),
-    ("+X", glm.translate(identity, glm.vec3(0.2, 0, 0)), identity, "+x"),
-    ("+Y", glm.translate(identity, glm.vec3(0, 0.2, 0)), identity, "+y"),
-    ("-X", glm.translate(identity, glm.vec3(-0.2, 0, 0)), identity, "-x"),
-    ("-Y", glm.translate(identity, glm.vec3(0, -0.2, 0)), identity, "-y"),
+# Test some heights
+print("Terrain height samples:")
+test_points = [
+    (0, 200, "center"),
+    (0, 150, "south edge"),
+    (0, 250, "north"),
+    (50, 200, "east"),
+    (-50, 200, "west"),
+    (75, 200, "far east (edge)"),
+    (0, 125, "just inside south boundary"),
+    (0, 120, "outside boundary (should fade)"),
 ]
+heights = []
+for wx, wz, label in test_points:
+    h = terrainHeight(wx, wz)
+    heights.append(h)
+    print(f"  ({wx:+4d}, {wz:+4d}) [{label}]: h={h:.2f}")
 
-for name, curr, prev, check in tests:
-    renderer.render_scene(curr, vp, prev, vp)
-    mv = renderer.read_motion()
-    g = center_motion(mv, W, H)
-    if check == "zero":
-        assert np.abs(mv).max() < 1e-5, "FAIL"
-        print("  %-10s PASS (max |mv| < 1e-5)" % name)
-    elif check == "+x":
-        assert g[0] > 0 and abs(g[1]) < 0.005, "FAIL"
-        print("  %-10s PASS (mv_x=%+.6f)" % (name, g[0]))
-    elif check == "+y":
-        assert g[1] > 0 and abs(g[0]) < 0.005, "FAIL"
-        print("  %-10s PASS (mv_y=%+.6f)" % (name, g[1]))
-    elif check == "-x":
-        assert g[0] < 0, "FAIL"
-        print("  %-10s PASS (mv_x=%+.6f)" % (name, g[0]))
-    elif check == "-y":
-        assert g[1] < 0, "FAIL"
-        print("  %-10s PASS (mv_y=%+.6f)" % (name, g[1]))
+print(f"\nHeight range: {min(heights):.2f} - {max(heights):.2f}")
+print(f"Expected max: {FOREST_AMPLITUDE}")
 
-# === GLSL end-to-end ===
-print("\n=== GLSL Mode (30 frames) ===\n")
-renderer2 = Renderer(W, H)
-view2 = glm.lookAt(glm.vec3(0, 1, 4), glm.vec3(0, 0, 0), glm.vec3(0, 1, 0))
-vp2 = proj * view2
-angle = 0.0
-axis = glm.normalize(glm.vec3(1, 1, 0))
-prev_vp2 = vp2
+# Count how many terrain cells would be placed (h > 0.1)
+step = FOREST_GRID_SPACING
+half = FOREST_HALF_EXTENT
+count_total = 0
+count_active = 0
+heights_grid = []
+for ix_i in range(int(-half/step), int(half/step)+1):
+    for iz_i in range(int(-half/step), int(half/step)+1):
+        ix = ix_i * step
+        iz = iz_i * step
+        wx = FOREST_CENTER_X + ix
+        wz = FOREST_CENTER_Z + iz
+        h = terrainHeight(wx, wz)
+        count_total += 1
+        if h >= 0.1:
+            count_active += 1
+            heights_grid.append(h)
 
-for frame in range(30):
-    dt = 1.0 / 60.0
-    prev_m = glm.rotate(identity, angle, axis)
-    angle += 1.5 * dt
-    curr_m = glm.rotate(identity, angle, axis)
-    renderer2.render_scene(curr_m, vp2, prev_m, prev_vp2)
-    renderer2.warp_noise()
-    w = renderer2.read_noise().transpose(2, 0, 1)
-    rg, _ = regaussianize(w)
-    renderer2.upload_noise(rg.transpose(1, 2, 0))
-    prev_vp2 = vp2
-    if frame in [0, 29]:
-        m, s = rg.mean(), rg.std()
-        u = len(np.unique(rg[0].ravel()))
-        print("  Frame %2d: mean=%+.4f std=%.4f unique_ch0=%d/%d" % (frame, m, s, u, W * H))
-        assert abs(m) < 0.15 and 0.8 < s < 1.2, "FAIL"
+print(f"\nTerrain grid: {count_total} total, {count_active} active (h >= 0.1)")
+print(f"Active height range: {min(heights_grid):.2f} - {max(heights_grid):.2f}")
+print(f"Total instances from terrain: {count_active}")
+print(f"Within 8192 instance budget: {count_active < 7000}")
 
-print("  GLSL PASSED")
-
-# === Taichi end-to-end ===
-print("\n=== Taichi Mode (30 frames) ===\n")
-from taichi_warp import TaichiWarper
-
-renderer3 = Renderer(W, H)
-tw = TaichiWarper(W, H, channels=4)
-renderer3.upload_noise(tw.get_init_noise_for_gpu())
-angle = 0.0
-prev_vp3 = vp2
-
-for frame in range(30):
-    dt = 1.0 / 60.0
-    prev_m = glm.rotate(identity, angle, axis)
-    angle += 1.5 * dt
-    curr_m = glm.rotate(identity, angle, axis)
-    renderer3.render_scene(curr_m, vp2, prev_m, prev_vp3)
-    motion = renderer3.read_motion()
-    result = tw.step(motion)
-    renderer3.upload_noise(result)
-    prev_vp3 = vp2
-    if frame in [0, 29]:
-        m, s = result.mean(), result.std()
-        print("  Frame %2d: mean=%+.4f std=%.4f" % (frame, m, s))
-        assert abs(m) < 0.15 and 0.7 < s < 1.3, "FAIL"
-
-print("  Taichi PASSED")
-
-pygame.quit()
-print("\n=== ALL TESTS PASSED ===")
+# Check where terrain starts appearing (south boundary fade)
+print("\nSouth edge fade-in (at X=0):")
+for wz in range(120, 175, 5):
+    h = terrainHeight(0, wz)
+    print(f"  Z={wz}: h={h:.3f}")

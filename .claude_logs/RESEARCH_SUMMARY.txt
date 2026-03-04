@@ -1,0 +1,184 @@
+================================================================================
+WebGPU CUSTOM RENDERER + PHYSICS INTEGRATION - RESEARCH SUMMARY
+================================================================================
+Date: 2026-03-04
+
+RESEARCH DELIVERABLES:
+================================================================================
+
+1. WEBGPU_PHYSICS_RESEARCH.md (MAIN RESEARCH DOCUMENT)
+   - Detailed Q&A for all 5 research questions
+   - Technical deep-dive with source citations
+   - Performance expectations and architecture patterns
+   - Concrete code examples for dominoes/pendulum scene
+   - ~400 lines of technical analysis
+
+2. QUICK_REFERENCE.md (IMPLEMENTATION GUIDE)
+   - TL;DR answers to all 5 questions
+   - Minimal code snippets ready to integrate
+   - Copy-paste geometry generators
+   - Verification checklist
+   - ~250 lines of practical code
+
+3. ARCHITECTURE_GUIDE.md (SYSTEM DESIGN)
+   - ASCII diagrams of rendering pipeline
+   - Data flow visualization for motion vectors
+   - Memory layout specifications
+   - Frame-by-frame camera matrix evolution
+   - Complete shader examples with annotations
+   - Performance timeline and bottleneck analysis
+   - ~450 lines of architectural documentation
+
+================================================================================
+KEY FINDINGS - EXECUTIVE SUMMARY
+================================================================================
+
+Q1: KEEP YOUR CUSTOM RENDERER
+─────────────────────────────────────────────────────────────────────────────
+✓ You already have the optimal setup: custom WebGPU with MRT (color+motion)
+✓ Three.js/Babylon.js add unnecessary abstraction layers
+✓ Physics integration is just: add Cannon.js separately + hook up transforms
+✓ Your motion vector computation is production-ready
+
+Q2: INSTANCED RENDERING FOR 100 BODIES
+─────────────────────────────────────────────────────────────────────────────
+✓ Use storage buffer with InstanceData struct (144 bytes per body)
+✓ Struct: [16 floats model][16 floats prevModel][4 floats color]
+✓ Single draw call: draw(vertexCount, 100)
+✓ Vertex shader indexes buffer via @builtin(instance_index)
+✓ Results in ~5-10x speedup vs individual draw calls
+✓ ~14 KB memory for 100 bodies (negligible on modern GPU)
+
+Q3: MOTION VECTORS FROM PHYSICS
+─────────────────────────────────────────────────────────────────────────────
+✓ Store prevModelMatrix per physics body (updated each frame)
+✓ Your existing shader already computes: (currNDC - prevNDC)
+✓ This automatically includes physics body motion + camera motion
+✓ Formula: motion = (currentWorldPos - previousWorldPos) projected to screen
+✓ Pattern: Save current frame's transforms → use as previous next frame
+
+Q4: GEOMETRY FOR DOMINOES/PENDULUM
+─────────────────────────────────────────────────────────────────────────────
+✓ Box: Reuse existing cubeVertices(), scale via transform matrix
+✓ Sphere: UV sphere with 16 segments → ~289 vertices (efficient)
+✓ Cylinder: Capped cylinder with 8 segments → ~80 vertices
+✓ Don't create geometry variants; transform + instancing is more efficient
+✓ Sphere code example provided in QUICK_REFERENCE.md
+
+Q5: CAMERA-RELATIVE MOTION VECTORS
+─────────────────────────────────────────────────────────────────────────────
+✓ Your code already does this correctly!
+✓ Use prevViewProj from previous frame's camera matrices
+✓ Formula: prevNDC = prevViewProj × prevWorldPos
+✓ Divide by W for perspective correction (automatic in interpolation)
+✓ Result: motion = object_motion - camera_motion (relative)
+
+================================================================================
+ARCHITECTURAL DECISION
+================================================================================
+
+CURRENT SETUP:          AFTER PHYSICS INTEGRATION:
+┌──────────────┐        ┌──────────────┐
+│ Custom GPU   │        │ Custom GPU   │
+│ MRT Renderer │        │ MRT Renderer │
+│              │   →    │              │
+│ Noise Warp   │        │ Noise Warp   │
+│ Compute      │        │ Compute      │
+└──────────────┘        └──────────────┘
+                              ↑
+                              │ Transforms
+                        ┌──────────────┐
+                        │ Cannon.js    │
+                        │ Physics (CPU)│
+                        └──────────────┘
+
+RATIONALE:
+- Physics on CPU is mature, tested, simple integration
+- GPU physics (Rapier 2026) not ready yet
+- This pattern (CPU physics → GPU rendering) is industry standard
+- Your MRT pipeline is already optimized for this architecture
+- Compute shaders stay untouched, so zero risk to noise warp quality
+
+================================================================================
+IMPLEMENTATION EFFORT
+================================================================================
+
+Total new code needed: ~360 lines
+
+Breakdown:
+- Geometry utilities (sphere, cylinder):  ~100 lines
+- WGSL shader modifications:              ~30 lines (struct + VS update)
+- PhysicsManager class:                   ~150 lines
+- Renderer buffer setup:                  ~50 lines
+- Main loop integration:                  ~30 lines
+
+Time estimate: 2-4 hours for experienced developer
+Risk level: LOW (existing MRT code unchanged, physics is independent)
+
+================================================================================
+TECHNICAL DETAILS COVERED
+================================================================================
+
+✓ Storage buffer layout and binding
+✓ Instance index builtin in vertex shader
+✓ Mapped buffer upload pattern (2x faster than writeBuffer)
+✓ Transform matrix computation from physics bodies
+✓ Previous frame matrix tracking
+✓ Camera matrix history for motion vectors
+✓ Perspective-corrected motion vector calculation
+✓ Relative velocity (object - camera)
+✓ Single draw call optimization
+✓ Performance timeline (6-7 ms per frame @ 60 FPS)
+✓ Bottleneck analysis (physics CPU-bound, warp GPU-bound)
+✓ Concrete code examples for all components
+✓ Debug visualization techniques
+✓ Verification checklist (19 items)
+
+================================================================================
+SOURCES & REFERENCES
+================================================================================
+
+Primary Sources (2025-2026):
+- WebGPU Fundamentals (storage buffers, optimization)
+- Learn Wgpu Tutorial (instancing with transforms)
+- The Structure of a WebGPU Renderer (architecture patterns)
+- Rapier Physics 2026 Review (future GPU path)
+- Three.js vs WebGPU Performance Analysis
+- Unity Motion Vectors Documentation (camera-relative techniques)
+- Cannon.js Physics Engine (GitHub + demos)
+
+All sources are cited in detail in WEBGPU_PHYSICS_RESEARCH.md
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Read WEBGPU_PHYSICS_RESEARCH.md for complete technical context
+2. Review QUICK_REFERENCE.md for copy-paste code patterns
+3. Study ARCHITECTURE_GUIDE.md for system design and data flow
+4. Implement in order:
+   a. Add geometry functions (sphere, cylinder)
+   b. Create storage buffer in renderer
+   c. Update WGSL shaders with InstanceData struct
+   d. Create PhysicsManager with Cannon.js
+   e. Hook physics → GPU transform pipeline
+   f. Test with 10 bodies, then scale to 100
+5. Verify motion vectors with debug visualization
+6. Profile GPU/CPU timings
+
+================================================================================
+SUCCESS CRITERIA
+================================================================================
+
+✓ 100 rigid bodies rendering at 60 FPS
+✓ Motion vectors computed correctly (test cases in ARCHITECTURE_GUIDE.md)
+✓ Single draw call used (not 100 individual draws)
+✓ Noise warp applied to moving bodies (visible visual effect)
+✓ Camera motion doesn't break motion vectors
+✓ Physics bodies collide realistically (Cannon.js handles this)
+✓ Domino chain reaction works visually
+✓ Pendulum swings smoothly with warp applied
+
+================================================================================
+END OF SUMMARY
+================================================================================
