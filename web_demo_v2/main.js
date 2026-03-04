@@ -7,10 +7,33 @@ import { WebGPURenderer } from './renderer.js';
 
 const { mat4, vec3, glMatrix } = window.glMatrix;
 
-const WIDTH = 2048;
-const HEIGHT = 2048;
-
+const RESOLUTIONS = [2048, 1024, 512, 256];
 const MODE_NAMES = ['noise', 'color', 'motion', 'side-by-side', 'raw'];
+const STORAGE_KEY = 'iinw_v2_settings';
+
+// ---------------------------------------------------------------------------
+// Settings persistence
+// ---------------------------------------------------------------------------
+
+const DEFAULTS = {
+    resIdx: 0,
+    blueNoise: false,
+    greyscale: false,
+    uniformDisplay: false,
+    retina: true,
+    bilinear: true,
+};
+
+function loadSettings() {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { ...DEFAULTS };
+    const saved = JSON.parse(raw);
+    return { ...DEFAULTS, ...saved };
+}
+
+function saveSettings(s) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+}
 
 // ---------------------------------------------------------------------------
 // FPS Camera (pointer lock + WASD/EQ)
@@ -42,7 +65,7 @@ class FPSCamera {
         if (this.keys['KeyS'] || this.keys['ArrowDown'])  vec3.scaleAndAdd(this.position, this.position, fwd, -v);
         if (this.keys['KeyA'] || this.keys['ArrowLeft'])   vec3.scaleAndAdd(this.position, this.position, right, -v);
         if (this.keys['KeyD'] || this.keys['ArrowRight']) vec3.scaleAndAdd(this.position, this.position, right, v);
-        if (this.keys['KeyE'] || this.keys['Space'])      this.position[1] += v;
+        if (this.keys['KeyE'])                             this.position[1] += v;
         if (this.keys['KeyQ'] || this.keys['ShiftLeft'])  this.position[1] -= v;
     }
 
@@ -120,20 +143,11 @@ class SpinningCube {
 // ---------------------------------------------------------------------------
 
 async function main() {
-    // URL params for benchmark tuning (e.g. ?brownian_wg=128)
     const params = new URLSearchParams(window.location.search);
 
     const canvas = document.getElementById('canvas');
-    canvas.width = WIDTH;
-    canvas.height = HEIGHT;
-    // Retina: render at full resolution, display at half CSS size
-    const dpr = window.devicePixelRatio || 1;
-    canvas.style.width = (WIDTH / dpr) + 'px';
-    canvas.style.height = (HEIGHT / dpr) + 'px';
-
     const statsEl = document.getElementById('stats');
     const controlsEl = document.getElementById('controls');
-    const hintEl = document.getElementById('hint');
     const errorEl = document.getElementById('error');
 
     // Check WebGPU support
@@ -142,12 +156,83 @@ async function main() {
         return;
     }
 
-    let renderer;
-    try {
-        renderer = new WebGPURenderer(canvas, WIDTH, HEIGHT);
-        const brownianWG = parseInt(params.get('brownian_wg')) || 256;
-        renderer.brownianWGOverride = brownianWG;
+    // --- Load saved settings ---
+    let settings = loadSettings();
+
+    let resIdx = settings.resIdx;
+    let W = RESOLUTIONS[resIdx];
+    let H = W;
+    let retinaOn = settings.retina;
+    let bilinearOn = settings.bilinear;
+    let greyscaleOn = settings.greyscale;
+    let uniformDisplayOn = settings.uniformDisplay;
+    let blueNoiseOn = settings.blueNoise;
+    let renderer = null;
+    let displayMode = 0;
+    let frameSeed = 42;
+
+    // --- UI elements ---
+    const resBtn = document.getElementById('resBtn');
+    const blueNoiseBtn = document.getElementById('blueNoiseBtn');
+    const greyBtn = document.getElementById('greyBtn');
+    const uniformBtn = document.getElementById('uniformBtn');
+    const retinaBtn = document.getElementById('retinaBtn');
+    const interpBtn = document.getElementById('interpBtn');
+    const resetBtn = document.getElementById('resetBtn');
+
+    // --- Sync UI to loaded settings ---
+    function syncUI() {
+        resBtn.textContent = W;
+        blueNoiseBtn.textContent = `Blue Noise: ${blueNoiseOn ? 'ON' : 'OFF'}`;
+        blueNoiseBtn.classList.toggle('on', blueNoiseOn);
+        greyBtn.textContent = `Grey: ${greyscaleOn ? 'ON' : 'OFF'}`;
+        greyBtn.classList.toggle('on', greyscaleOn);
+        uniformBtn.textContent = `Uniform: ${uniformDisplayOn ? 'ON' : 'OFF'}`;
+        uniformBtn.classList.toggle('on', uniformDisplayOn);
+        retinaBtn.textContent = `Retina: ${retinaOn ? 'ON' : 'OFF'}`;
+        retinaBtn.classList.toggle('on', retinaOn);
+        interpBtn.textContent = `Interp: ${bilinearOn ? 'Bilinear' : 'Nearest'}`;
+        interpBtn.classList.toggle('on', !bilinearOn);
+    }
+
+    function persistSettings() {
+        saveSettings({
+            resIdx, blueNoise: blueNoiseOn, greyscale: greyscaleOn,
+            uniformDisplay: uniformDisplayOn, retina: retinaOn, bilinear: bilinearOn,
+        });
+    }
+
+    // --- Canvas sizing ---
+    function updateCanvasSize() {
+        canvas.width = W;
+        canvas.height = H;
+        const dpr = retinaOn ? (window.devicePixelRatio || 1) : 1;
+        canvas.style.width = (W / dpr) + 'px';
+        canvas.style.height = (H / dpr) + 'px';
+    }
+
+    function updateInterpolation() {
+        canvas.style.imageRendering = bilinearOn ? 'auto' : 'pixelated';
+    }
+
+    // --- Renderer lifecycle ---
+    async function createRenderer() {
+        if (renderer) renderer.destroy();
+        renderer = new WebGPURenderer(canvas, W, H);
+        renderer.brownianWGOverride = parseInt(params.get('brownian_wg')) || 256;
+        renderer.blueNoiseEnabled = blueNoiseOn;
+        renderer.greyscaleEnabled = greyscaleOn;
+        renderer.uniformDisplayEnabled = uniformDisplayOn;
         await renderer.init();
+    }
+
+    // --- Initial setup ---
+    updateCanvasSize();
+    updateInterpolation();
+    syncUI();
+
+    try {
+        await createRenderer();
     } catch (e) {
         errorEl.textContent = e.message;
         throw e;
@@ -155,19 +240,93 @@ async function main() {
 
     statsEl.textContent = 'WebGPU ready. Click to start.';
 
+    // --- Button handlers ---
+
+    function cycleResolution() {
+        resIdx = (resIdx + 1) % RESOLUTIONS.length;
+        W = RESOLUTIONS[resIdx];
+        H = W;
+        resBtn.textContent = W;
+        updateCanvasSize();
+        persistSettings();
+        createRenderer();
+    }
+    resBtn.addEventListener('click', cycleResolution);
+
+    function toggleBlueNoise() {
+        blueNoiseOn = !blueNoiseOn;
+        renderer.blueNoiseEnabled = blueNoiseOn;
+        blueNoiseBtn.textContent = `Blue Noise: ${blueNoiseOn ? 'ON' : 'OFF'}`;
+        blueNoiseBtn.classList.toggle('on', blueNoiseOn);
+        persistSettings();
+    }
+    blueNoiseBtn.addEventListener('click', toggleBlueNoise);
+
+    function toggleGreyscale() {
+        greyscaleOn = !greyscaleOn;
+        renderer.greyscaleEnabled = greyscaleOn;
+        greyBtn.textContent = `Grey: ${greyscaleOn ? 'ON' : 'OFF'}`;
+        greyBtn.classList.toggle('on', greyscaleOn);
+        persistSettings();
+    }
+    greyBtn.addEventListener('click', toggleGreyscale);
+
+    function toggleUniformDisplay() {
+        uniformDisplayOn = !uniformDisplayOn;
+        renderer.uniformDisplayEnabled = uniformDisplayOn;
+        uniformBtn.textContent = `Uniform: ${uniformDisplayOn ? 'ON' : 'OFF'}`;
+        uniformBtn.classList.toggle('on', uniformDisplayOn);
+        persistSettings();
+    }
+    uniformBtn.addEventListener('click', toggleUniformDisplay);
+
+    function toggleRetina() {
+        retinaOn = !retinaOn;
+        retinaBtn.textContent = `Retina: ${retinaOn ? 'ON' : 'OFF'}`;
+        retinaBtn.classList.toggle('on', retinaOn);
+        updateCanvasSize();
+        persistSettings();
+    }
+    retinaBtn.addEventListener('click', toggleRetina);
+
+    function toggleInterp() {
+        bilinearOn = !bilinearOn;
+        interpBtn.textContent = `Interp: ${bilinearOn ? 'Bilinear' : 'Nearest'}`;
+        interpBtn.classList.toggle('on', !bilinearOn);
+        updateInterpolation();
+        persistSettings();
+    }
+    interpBtn.addEventListener('click', toggleInterp);
+
+    function resetAll() {
+        localStorage.removeItem(STORAGE_KEY);
+        const d = DEFAULTS;
+        resIdx = d.resIdx; W = RESOLUTIONS[resIdx]; H = W;
+        blueNoiseOn = d.blueNoise;
+        greyscaleOn = d.greyscale;
+        uniformDisplayOn = d.uniformDisplay;
+        retinaOn = d.retina;
+        bilinearOn = d.bilinear;
+        syncUI();
+        updateCanvasSize();
+        updateInterpolation();
+        createRenderer();
+    }
+    resetBtn.addEventListener('click', resetAll);
+
+    // --- Camera & cube ---
     const camera = new FPSCamera();
     const cube = new SpinningCube();
 
-    const proj = mat4.create();
-    mat4.perspective(proj, glMatrix.toRadian(60), WIDTH / HEIGHT, 0.1, 100);
+    let proj = mat4.create();
+    mat4.perspective(proj, glMatrix.toRadian(60), 1.0, 0.1, 100);
 
     let prevViewProj = mat4.create();
     mat4.mul(prevViewProj, proj, camera.viewMatrix());
 
-    let displayMode = 0;
     let mouseCaptured = false;
+    let paused = false;
     let lastTime = performance.now();
-    let frameSeed = 42;
 
     // FPS tracking
     let frameCounter = 0;
@@ -175,7 +334,6 @@ async function main() {
     let displayFPS = 0;
 
     // CPU frame timing
-    let cpuFrameMs = 0;
     const cpuFrameHistory = [];
 
     // --- Input handlers ---
@@ -187,6 +345,12 @@ async function main() {
         if (e.code === 'Escape' && mouseCaptured) {
             document.exitPointerLock();
         }
+        if (e.code === 'KeyB') toggleBlueNoise();
+        if (e.code === 'KeyG') toggleGreyscale();
+        if (e.code === 'KeyU') toggleUniformDisplay();
+        if (e.code === 'KeyR' && !mouseCaptured) cycleResolution();
+        if (e.code === 'KeyT') toggleRetina();
+        if (e.code === 'KeyI') toggleInterp();
     });
     document.addEventListener('keyup', (e) => { camera.keys[e.code] = false; });
     canvas.addEventListener('click', () => {
@@ -202,6 +366,11 @@ async function main() {
 
     // --- Game loop ---
     function frame(now) {
+        if (!renderer) { requestAnimationFrame(frame); return; }
+
+        paused = camera.keys['Space'] === true;
+        if (paused) { lastTime = now; requestAnimationFrame(frame); return; }
+
         const dt = Math.min((now - lastTime) / 1000, 0.1);
         lastTime = now;
 
@@ -222,8 +391,8 @@ async function main() {
             frameSeed,
         });
 
-        cpuFrameMs = performance.now() - cpuStart;
-        cpuFrameHistory.push(cpuFrameMs);
+        const cpuMs = performance.now() - cpuStart;
+        cpuFrameHistory.push(cpuMs);
         if (cpuFrameHistory.length > 200) cpuFrameHistory.shift();
 
         prevViewProj = viewProj;
@@ -248,14 +417,13 @@ async function main() {
 
         let lines = [];
 
-        // Line 1: FPS + noise stats + mode
         lines.push(
             `FPS: ${displayFPS} | ` +
+            `${W}x${H} | ` +
             `mean: ${mean.toFixed(3)} | std: ${std.toFixed(3)} | ` +
             `mode: ${MODE_NAMES[displayMode]}`
         );
 
-        // Line 2: GPU per-phase breakdown (if available)
         if (gpuStats) {
             const fmt = (s) => `${s.mean.toFixed(2)}±${s.std.toFixed(2)}`;
             lines.push(
@@ -269,7 +437,6 @@ async function main() {
             );
         }
 
-        // Line 3: CPU encode+submit timing
         if (cpuFrameHistory.length > 10) {
             const recent = cpuFrameHistory.slice(-100);
             const cpuMean = recent.reduce((a,b) => a+b, 0) / recent.length;
@@ -279,7 +446,6 @@ async function main() {
 
         statsEl.textContent = lines.join('\n');
 
-        // Expose for test suite
         window.__stats = {
             fps: displayFPS,
             noiseStats: { mean, std },
@@ -287,7 +453,6 @@ async function main() {
             cpuFrameMs: cpuFrameHistory.slice(-100),
         };
 
-        // Warn if noise stats drift
         if (Math.abs(mean) > 0.1 || Math.abs(std - 1.0) > 0.2) {
             console.warn(`Noise stats drifting: mean=${mean.toFixed(4)}, std=${std.toFixed(4)}`);
         }

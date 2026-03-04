@@ -7,6 +7,8 @@ import { cubeVertices, floorVertices, quadVertices } from './geometry.js';
 import {
     sceneWGSL, displayWGSL,
     buildDeformWGSL, backwardMapWGSL, brownianWGSL, normalizeWGSL,
+    blueNoiseBlurWGSL, blueNoiseHistCountWGSL, blueNoisePrefixSumWGSL,
+    blueNoiseScatterSortWGSL, blueNoiseScatterMatchWGSL,
 } from './shaders.js';
 
 const NUM_TIMESTAMPS = 12; // 2 per pass × 6 passes
@@ -66,6 +68,15 @@ export class WebGPURenderer {
         // Stats readback state
         this._statsMapping = false;
         this.noiseStats = { mean: 0, std: 1 };
+
+        // Blue noise state
+        this.blueNoiseEnabled = false;
+        this.blueNoiseIterations = 10;
+        this.blueNoiseCutoffDivider = 8.0;
+
+        // Display flags
+        this.greyscaleEnabled = false;
+        this.uniformDisplayEnabled = false;
     }
 
     async init() {
@@ -95,6 +106,31 @@ export class WebGPURenderer {
         this._createVertexBuffers();
         this._initProfiler();
         this._initNoise();
+    }
+
+    /**
+     * Destroy all GPU resources. Call before creating a new renderer at different resolution.
+     */
+    destroy() {
+        // Destroy textures
+        this.colorTex?.destroy();
+        this.motionTex?.destroy();
+        this.depthTex?.destroy();
+
+        // Destroy buffers
+        const bufs = [
+            this.noiseBuf, this.bufferBuf, this.totalRequestBuf, this.ticketCountBuf,
+            this.masterFieldBuf, this.areaFieldBuf, this.deformationBuf,
+            this.floorUniformBuf, this.cubeUniformBuf, this.computeUniformBuf, this.displayUniformBuf,
+            this._statsStagingBuf,
+            this.bnHpBuf, this.bnSortedBuf, this.bnHistBuf, this.bnSlotsBuf, this.bnBackupBuf,
+            this.bnBlurHUniformBuf, this.bnBlurVUniformBuf,
+            this.cubeVB, this.floorVB, this.quadVB,
+        ];
+        if (this.hasTimestamps) bufs.push(this.querySet, this.tsResolveBuf, this.tsReadBuf);
+        for (const b of bufs) b?.destroy?.();
+
+        // Don't destroy the device — it's shared/reusable
     }
 
     // -----------------------------------------------------------------------
@@ -167,6 +203,26 @@ export class WebGPURenderer {
             size: N * C * f4,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
+
+        // Blue noise buffers
+        const NUM_BINS = 4096;
+        this.bnHpBuf = storage(N * C * f4);                           // high-passed noise
+        this.bnSortedBuf = storage(N * C * f4);                       // sorted target (planar: 4 × N)
+        this.bnHistBuf = storage(C * NUM_BINS * f4, GPUBufferUsage.COPY_DST);  // histogram (clearable)
+        this.bnSlotsBuf = storage(N * C * f4);                        // per-pixel per-channel slots
+        // Backup buffer: noiseBuf is modified in-place for display, then restored for next frame's warp
+        this.bnBackupBuf = device.createBuffer({
+            size: N * C * f4,
+            usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        });
+        // Blur uniforms: {H, W, sigma, direction}
+        this.bnBlurHUniformBuf = device.createBuffer({
+            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.bnBlurVUniformBuf = device.createBuffer({
+            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        // Histogram uses computeUniformBuf (just needs H, W)
     }
 
     _createPipelines() {
@@ -242,6 +298,13 @@ export class WebGPURenderer {
         this.backwardMapPipeline = computePipeline(backwardMapMod);
         this.brownianPipeline    = computePipeline(brownianMod, { WG_SIZE: this.brownianWG });
         this.normalizePipeline   = computePipeline(normalizeMod);
+
+        // Blue noise pipelines
+        this.bnBlurPipeline         = computePipeline(mod(blueNoiseBlurWGSL));
+        this.bnHistCountPipeline    = computePipeline(mod(blueNoiseHistCountWGSL));
+        this.bnPrefixSumPipeline    = computePipeline(mod(blueNoisePrefixSumWGSL));
+        this.bnScatterSortPipeline  = computePipeline(mod(blueNoiseScatterSortWGSL));
+        this.bnScatterMatchPipeline = computePipeline(mod(blueNoiseScatterMatchWGSL));
     }
 
     _createBindGroups() {
@@ -316,6 +379,84 @@ export class WebGPURenderer {
                 { binding: 4, resource: buf(this.noiseBuf) },
             ],
         });
+
+        // --- Blue noise bind groups ---
+        const bnBlurLayout = this.bnBlurPipeline.getBindGroupLayout(0);
+
+        // Blur horizontal: input=noiseBuf, output=bufferBuf(temp), original=noiseBuf(unused)
+        this.bnBlurHBindGroup = device.createBindGroup({
+            layout: bnBlurLayout,
+            entries: [
+                { binding: 0, resource: buf(this.bnBlurHUniformBuf) },
+                { binding: 1, resource: buf(this.noiseBuf) },
+                { binding: 2, resource: buf(this.bufferBuf) },
+                { binding: 3, resource: buf(this.noiseBuf) },
+            ],
+        });
+        // Blur vertical+subtract: input=bufferBuf(temp), output=bnHpBuf, original=noiseBuf
+        this.bnBlurVBindGroup = device.createBindGroup({
+            layout: bnBlurLayout,
+            entries: [
+                { binding: 0, resource: buf(this.bnBlurVUniformBuf) },
+                { binding: 1, resource: buf(this.bufferBuf) },
+                { binding: 2, resource: buf(this.bnHpBuf) },
+                { binding: 3, resource: buf(this.noiseBuf) },
+            ],
+        });
+
+        // Histogram count for initial sort: values=noiseBuf
+        this.bnHistCountSortBindGroup = device.createBindGroup({
+            layout: this.bnHistCountPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.computeUniformBuf) },
+                { binding: 1, resource: buf(this.noiseBuf) },
+                { binding: 2, resource: buf(this.bnHistBuf) },
+                { binding: 3, resource: buf(this.bnSlotsBuf) },
+            ],
+        });
+        // Histogram count for matching: values=bnHpBuf
+        this.bnHistCountMatchBindGroup = device.createBindGroup({
+            layout: this.bnHistCountPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.computeUniformBuf) },
+                { binding: 1, resource: buf(this.bnHpBuf) },
+                { binding: 2, resource: buf(this.bnHistBuf) },
+                { binding: 3, resource: buf(this.bnSlotsBuf) },
+            ],
+        });
+
+        // Prefix sum
+        this.bnPrefixSumBindGroup = device.createBindGroup({
+            layout: this.bnPrefixSumPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.bnHistBuf) },
+            ],
+        });
+
+        // Scatter sort: noise values → sorted order
+        this.bnScatterSortBindGroup = device.createBindGroup({
+            layout: this.bnScatterSortPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.computeUniformBuf) },
+                { binding: 1, resource: buf(this.noiseBuf) },
+                { binding: 2, resource: buf(this.bnHistBuf) },
+                { binding: 3, resource: buf(this.bnSlotsBuf) },
+                { binding: 4, resource: buf(this.bnSortedBuf) },
+            ],
+        });
+
+        // Scatter match: sorted target → noise by hp rank
+        this.bnScatterMatchBindGroup = device.createBindGroup({
+            layout: this.bnScatterMatchPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.computeUniformBuf) },
+                { binding: 1, resource: buf(this.bnHpBuf) },
+                { binding: 2, resource: buf(this.bnHistBuf) },
+                { binding: 3, resource: buf(this.bnSlotsBuf) },
+                { binding: 4, resource: buf(this.bnSortedBuf) },
+                { binding: 5, resource: buf(this.noiseBuf) },
+            ],
+        });
     }
 
     _createVertexBuffers() {
@@ -362,7 +503,94 @@ export class WebGPURenderer {
         for (let i = 0; i < data.length; i++) data[i] = randn();
         device.queue.writeBuffer(this.noiseBuf, 0, data);
 
-        // Display reads noise directly from noiseBuf — no texture copy needed
+        // Blue noise blur uniforms
+        this._updateBlurUniforms();
+    }
+
+    _updateBlurUniforms() {
+        const { H, W, device } = this;
+        const D0 = Math.min(H, W) / this.blueNoiseCutoffDivider;
+        const sigma = H / (2 * Math.PI * D0);
+        // Blur uniforms: {H, W, sigma, direction} — H and W are u32 but packed as bits in f32 buffer
+        // Actually the shader reads them as u32, so use Uint32Array for H,W and Float32Array for sigma
+        const hBuf = new ArrayBuffer(16);
+        const hU32 = new Uint32Array(hBuf);
+        const hF32 = new Float32Array(hBuf);
+        hU32[0] = H; hU32[1] = W; hF32[2] = sigma; hU32[3] = 0;
+        device.queue.writeBuffer(this.bnBlurHUniformBuf, 0, hU32);
+        const vBuf = new ArrayBuffer(16);
+        const vU32 = new Uint32Array(vBuf);
+        const vF32 = new Float32Array(vBuf);
+        vU32[0] = H; vU32[1] = W; vF32[2] = sigma; vU32[3] = 1;
+        device.queue.writeBuffer(this.bnBlurVUniformBuf, 0, vU32);
+    }
+
+    /**
+     * Encode blue noise conversion dispatches into the command encoder.
+     * Algorithm: alternating projections (Gaussian high-pass + histogram matching).
+     * Not pure: appends GPU commands to encoder.
+     */
+    _encodeBlueNoise(encoder, workgroups256) {
+        const { N } = this;
+
+        // Step 0: Sort initial noise values (counting sort)
+        encoder.clearBuffer(this.bnHistBuf);
+        const sortHistPass = encoder.beginComputePass();
+        sortHistPass.setPipeline(this.bnHistCountPipeline);
+        sortHistPass.setBindGroup(0, this.bnHistCountSortBindGroup);
+        sortHistPass.dispatchWorkgroups(workgroups256);
+        sortHistPass.end();
+
+        const sortPrefixPass = encoder.beginComputePass();
+        sortPrefixPass.setPipeline(this.bnPrefixSumPipeline);
+        sortPrefixPass.setBindGroup(0, this.bnPrefixSumBindGroup);
+        sortPrefixPass.dispatchWorkgroups(4);  // 4 channels
+        sortPrefixPass.end();
+
+        const sortScatterPass = encoder.beginComputePass();
+        sortScatterPass.setPipeline(this.bnScatterSortPipeline);
+        sortScatterPass.setBindGroup(0, this.bnScatterSortBindGroup);
+        sortScatterPass.dispatchWorkgroups(workgroups256);
+        sortScatterPass.end();
+
+        // Step 1-N: Iterative blur + histogram match
+        for (let i = 0; i < this.blueNoiseIterations; i++) {
+            // Gaussian blur horizontal: noiseBuf → bufferBuf (temp)
+            const blurH = encoder.beginComputePass();
+            blurH.setPipeline(this.bnBlurPipeline);
+            blurH.setBindGroup(0, this.bnBlurHBindGroup);
+            blurH.dispatchWorkgroups(workgroups256);
+            blurH.end();
+
+            // Gaussian blur vertical + subtract: bufferBuf → bnHpBuf (high-pass)
+            const blurV = encoder.beginComputePass();
+            blurV.setPipeline(this.bnBlurPipeline);
+            blurV.setBindGroup(0, this.bnBlurVBindGroup);
+            blurV.dispatchWorkgroups(workgroups256);
+            blurV.end();
+
+            // Histogram count on hp values
+            encoder.clearBuffer(this.bnHistBuf);
+            const histPass = encoder.beginComputePass();
+            histPass.setPipeline(this.bnHistCountPipeline);
+            histPass.setBindGroup(0, this.bnHistCountMatchBindGroup);
+            histPass.dispatchWorkgroups(workgroups256);
+            histPass.end();
+
+            // Prefix sum
+            const prefixPass = encoder.beginComputePass();
+            prefixPass.setPipeline(this.bnPrefixSumPipeline);
+            prefixPass.setBindGroup(0, this.bnPrefixSumBindGroup);
+            prefixPass.dispatchWorkgroups(4);
+            prefixPass.end();
+
+            // Scatter match: assign sorted values by hp rank → noiseBuf
+            const matchPass = encoder.beginComputePass();
+            matchPass.setPipeline(this.bnScatterMatchPipeline);
+            matchPass.setBindGroup(0, this.bnScatterMatchBindGroup);
+            matchPass.dispatchWorkgroups(workgroups256);
+            matchPass.end();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -404,8 +632,9 @@ export class WebGPURenderer {
 
         device.queue.writeBuffer(this.computeUniformBuf, 0,
             new Uint32Array([H, W, frameSeed, 0]));
+        const displayFlags = (this.greyscaleEnabled ? 1 : 0) | (this.uniformDisplayEnabled ? 2 : 0);
         device.queue.writeBuffer(this.displayUniformBuf, 0,
-            new Uint32Array([displayMode, W, H, 0]));
+            new Uint32Array([displayMode, W, H, displayFlags]));
 
         const encoder = device.createCommandEncoder();
 
@@ -515,6 +744,14 @@ export class WebGPURenderer {
         normPass.dispatchWorkgroups(workgroups256);
         normPass.end();
 
+        // --- Blue noise conversion (if enabled) ---
+        // Blue noise is POST-PROCESSING only: warp must always receive Gaussian noise.
+        // Backup noiseBuf before blue noise, restore after display.
+        if (this.blueNoiseEnabled) {
+            encoder.copyBufferToBuffer(this.noiseBuf, 0, this.bnBackupBuf, 0, N * this.C * 4);
+            this._encodeBlueNoise(encoder, workgroups256);
+        }
+
         // --- Pass 5: Display render (reads noise from storage buffer, no copy needed) ---
         const canvasView = this.ctx.getCurrentTexture().createView();
         const dispPass = encoder.beginRenderPass({
@@ -536,6 +773,11 @@ export class WebGPURenderer {
         dispPass.setVertexBuffer(0, this.quadVB);
         dispPass.draw(this.quadVertCount);
         dispPass.end();
+
+        // Restore Gaussian noise after display so next frame's warp receives clean input
+        if (this.blueNoiseEnabled) {
+            encoder.copyBufferToBuffer(this.bnBackupBuf, 0, this.noiseBuf, 0, N * this.C * 4);
+        }
 
         // --- Resolve timestamps ---
         if (this.hasTimestamps && !this._tsMapping) {

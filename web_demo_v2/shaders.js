@@ -1,6 +1,7 @@
 /**
  * WGSL shader sources for WebGPU V2.
- * 6 shader modules: scene (MRT), display, build_deform, backward_map, brownian, normalize.
+ * Warp shaders: scene (MRT), display, build_deform, backward_map, brownian, normalize.
+ * Blue noise shaders: blur, histCount, prefixSum, scatterSort, scatterMatch.
  */
 
 // ---------------------------------------------------------------------------
@@ -84,15 +85,42 @@ struct VsOut {
 @group(0) @binding(2) var motionTex: texture_2d<f32>;
 
 struct DisplayUniforms {
-    mode: u32,
-    W:    u32,
-    H:    u32,
+    mode:  u32,
+    W:     u32,
+    H:     u32,
+    flags: u32,  // bit 0: greyscale, bit 1: Gaussian→uniform (normal CDF)
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
 
 fn readNoise(col: u32, row: u32) -> vec4f {
     let idx = (row * disp.W + col) * 4u;
     return vec4f(noiseData[idx], noiseData[idx+1u], noiseData[idx+2u], noiseData[idx+3u]);
+}
+
+// Abramowitz & Stegun erf approximation 7.1.26 — error < 1.5e-7
+fn erf_approx(x: f32) -> f32 {
+    let ax = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * ax);
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    let result = 1.0 - poly * exp(-ax * ax);
+    return select(-result, result, x >= 0.0);
+}
+
+// Normal CDF: maps Gaussian → Uniform [0,1]
+fn normal_cdf(x: f32) -> f32 {
+    return 0.5 * (1.0 + erf_approx(x * 0.7071067811865476));
+}
+
+// Apply display flags (greyscale, Gaussian→uniform)
+fn applyFlags(n: vec4f) -> vec4f {
+    var v = n;
+    if ((disp.flags & 2u) != 0u) {
+        v = vec4f(normal_cdf(v.x), normal_cdf(v.y), normal_cdf(v.z), v.w);
+    }
+    if ((disp.flags & 1u) != 0u) {
+        v = vec4f(v.x, v.x, v.x, v.w);
+    }
+    return v;
 }
 
 @fragment fn fs(in: VsOut) -> @location(0) vec4f {
@@ -104,7 +132,11 @@ fn readNoise(col: u32, row: u32) -> vec4f {
 
     if (disp.mode == 0u) {
         let n = readNoise(col, row);
-        return vec4f(n.rgb / 5.0 + 0.5, 1.0);
+        let v = applyFlags(n);
+        if ((disp.flags & 2u) != 0u) {
+            return vec4f(v.rgb, 1.0);
+        }
+        return vec4f(v.rgb / 5.0 + 0.5, 1.0);
     } else if (disp.mode == 1u) {
         return textureLoad(colorTex, vec2u(col, row), 0);
     } else if (disp.mode == 2u) {
@@ -117,11 +149,16 @@ fn readNoise(col: u32, row: u32) -> vec4f {
         } else {
             let sc = min(u32((uv.x - 0.5) * 2.0 * f32(W)), W - 1u);
             let n = readNoise(sc, row);
-            return vec4f(n.rgb / 5.0 + 0.5, 1.0);
+            let v = applyFlags(n);
+            if ((disp.flags & 2u) != 0u) {
+                return vec4f(v.rgb, 1.0);
+            }
+            return vec4f(v.rgb / 5.0 + 0.5, 1.0);
         }
     } else {
         let n = readNoise(col, row);
-        return vec4f(n.rgb, 1.0);
+        let v = applyFlags(n);
+        return vec4f(v.rgb, 1.0);
     }
 }
 `;
@@ -446,6 +483,214 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             let seed = u.frameSeed * 7919u + 31337u + idx * C + c;
             noise[base + c] = randn(seed);
         }
+    }
+}
+`;
+
+// ===========================================================================
+// Blue Noise: alternating projections (spatial Gaussian high-pass + histogram match)
+// Equivalent to rp.convert_to_blue_noise but GPU-accelerated.
+// high_pass(x) = x - gaussian_blur(x, sigma) where sigma = N/(2*pi*D0)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Gaussian blur (separable, 9-tap radius-4, all 4 channels as vec4f)
+// direction=0: horizontal, direction=1: vertical + subtract original (= high-pass)
+// ---------------------------------------------------------------------------
+
+export const blueNoiseBlurWGSL = /* wgsl */`
+struct Uniforms {
+    H:     u32,
+    W:     u32,
+    sigma: f32,
+    direction: u32,  // 0=horizontal, 1=vertical+subtract
+}
+
+const RADIUS: i32 = 4;
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read>       input:    array<f32>;
+@group(0) @binding(2) var<storage, read_write> output:   array<f32>;
+@group(0) @binding(3) var<storage, read>       original: array<f32>;
+
+fn readVec4(buf: ptr<storage, array<f32>, read>, idx: u32) -> vec4f {
+    let b = idx * 4u;
+    return vec4f((*buf)[b], (*buf)[b+1u], (*buf)[b+2u], (*buf)[b+3u]);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= u.H * u.W) { return; }
+
+    let row = idx / u.W;
+    let col = idx % u.W;
+
+    var sum = vec4f(0.0);
+    var wSum: f32 = 0.0;
+    let inv2s2 = 1.0 / (2.0 * u.sigma * u.sigma);
+
+    for (var d: i32 = -RADIUS; d <= RADIUS; d++) {
+        var srcIdx: u32;
+        if (u.direction == 0u) {
+            let c = u32((i32(col) + d + i32(u.W)) % i32(u.W));
+            srcIdx = row * u.W + c;
+        } else {
+            let r = u32((i32(row) + d + i32(u.H)) % i32(u.H));
+            srcIdx = r * u.W + col;
+        }
+        let w = exp(-f32(d * d) * inv2s2);
+        sum += w * readVec4(&input, srcIdx);
+        wSum += w;
+    }
+
+    var result = sum / wSum;
+
+    // Vertical pass: high-pass = original - blurred
+    if (u.direction == 1u) {
+        result = readVec4(&original, idx) - result;
+    }
+
+    let b = idx * 4u;
+    output[b]      = result.x;
+    output[b + 1u] = result.y;
+    output[b + 2u] = result.z;
+    output[b + 3u] = result.w;
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Histogram count: quantize values, atomicAdd histogram, store per-pixel slot
+// Processes all 4 channels per pixel in one thread.
+// ---------------------------------------------------------------------------
+
+export const blueNoiseHistCountWGSL = /* wgsl */`
+const NUM_BINS: u32 = 4096u;
+const RANGE_MIN: f32 = -6.0;
+const RANGE_SCALE: f32 = 341.333333;  // NUM_BINS / (6.0 - (-6.0)) = 4096/12
+
+struct Uniforms { H: u32, W: u32, }
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read>       values:    array<f32>;
+@group(0) @binding(2) var<storage, read_write> histogram: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> slots:     array<u32>;
+
+fn quantize(val: f32) -> u32 {
+    return clamp(u32(floor((val - RANGE_MIN) * RANGE_SCALE)), 0u, NUM_BINS - 1u);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let pixel = gid.x;
+    if (pixel >= u.H * u.W) { return; }
+    let base = pixel * 4u;
+
+    for (var c: u32 = 0u; c < 4u; c++) {
+        let bin = quantize(values[base + c]);
+        let slot = atomicAdd(&histogram[c * NUM_BINS + bin], 1u);
+        slots[base + c] = slot;
+    }
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Prefix sum: exclusive scan on histogram (4 channels × 4096 bins)
+// One workgroup per channel, single-thread serial scan (4096 entries is tiny)
+// ---------------------------------------------------------------------------
+
+export const blueNoisePrefixSumWGSL = /* wgsl */`
+const NUM_BINS: u32 = 4096u;
+
+@group(0) @binding(0) var<storage, read_write> histogram: array<u32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(workgroup_id) wid: vec3u) {
+    let channel = wid.x;
+    let offset = channel * NUM_BINS;
+
+    var sum: u32 = 0u;
+    for (var i: u32 = 0u; i < NUM_BINS; i++) {
+        let val = histogram[offset + i];
+        histogram[offset + i] = sum;
+        sum += val;
+    }
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Scatter sort: place noise values into sorted order using counting sort ranks
+// sortedTarget[c*N + rank] = values[pixel*4 + c]  (planar layout)
+// ---------------------------------------------------------------------------
+
+export const blueNoiseScatterSortWGSL = /* wgsl */`
+const NUM_BINS: u32 = 4096u;
+const RANGE_MIN: f32 = -6.0;
+const RANGE_SCALE: f32 = 341.333333;
+
+struct Uniforms { H: u32, W: u32, }
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read>       values:    array<f32>;
+@group(0) @binding(2) var<storage, read>       histogram: array<u32>;
+@group(0) @binding(3) var<storage, read>       slots:     array<u32>;
+@group(0) @binding(4) var<storage, read_write> sorted:    array<f32>;
+
+fn quantize(val: f32) -> u32 {
+    return clamp(u32(floor((val - RANGE_MIN) * RANGE_SCALE)), 0u, NUM_BINS - 1u);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let pixel = gid.x;
+    if (pixel >= u.H * u.W) { return; }
+    let N = u.H * u.W;
+    let base = pixel * 4u;
+
+    for (var c: u32 = 0u; c < 4u; c++) {
+        let val = values[base + c];
+        let bin = quantize(val);
+        let rank = histogram[c * NUM_BINS + bin] + slots[base + c];
+        sorted[c * N + rank] = val;
+    }
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Scatter match: histogram matching — assign sorted target values by hp rank
+// output[pixel*4 + c] = sortedTarget[c*N + rank_in_hp]
+// ---------------------------------------------------------------------------
+
+export const blueNoiseScatterMatchWGSL = /* wgsl */`
+const NUM_BINS: u32 = 4096u;
+const RANGE_MIN: f32 = -6.0;
+const RANGE_SCALE: f32 = 341.333333;
+
+struct Uniforms { H: u32, W: u32, }
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read>       hpValues:  array<f32>;
+@group(0) @binding(2) var<storage, read>       histogram: array<u32>;
+@group(0) @binding(3) var<storage, read>       slots:     array<u32>;
+@group(0) @binding(4) var<storage, read>       sorted:    array<f32>;
+@group(0) @binding(5) var<storage, read_write> output:    array<f32>;
+
+fn quantize(val: f32) -> u32 {
+    return clamp(u32(floor((val - RANGE_MIN) * RANGE_SCALE)), 0u, NUM_BINS - 1u);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let pixel = gid.x;
+    if (pixel >= u.H * u.W) { return; }
+    let N = u.H * u.W;
+    let base = pixel * 4u;
+
+    for (var c: u32 = 0u; c < 4u; c++) {
+        let val = hpValues[base + c];
+        let bin = quantize(val);
+        let rank = histogram[c * NUM_BINS + bin] + slots[base + c];
+        output[base + c] = sorted[c * N + rank];
     }
 }
 `;
