@@ -185,6 +185,7 @@ function main() {
     mat4.mul(prevViewProj, proj, camera.viewMatrix());
 
     let displayMode = 0;
+    const MODE_NAMES = ['noise', 'color', 'motion', 'side-by-side', 'raw'];
     let mouseCaptured = false;
     let lastTime = performance.now();
     let frameCounter = 0;
@@ -249,7 +250,7 @@ function main() {
             fpsAccum = 0;
 
             const { mean, std } = warper.stats();
-            statsEl.textContent = `FPS: ${displayFPS} | mean: ${mean.toFixed(3)} | std: ${std.toFixed(3)} | mode: ${displayMode}`;
+            statsEl.textContent = `FPS: ${displayFPS} | mean: ${mean.toFixed(3)} | std: ${std.toFixed(3)} | mode: ${MODE_NAMES[displayMode]}`;
 
             // Validation: log warning if stats drift too far from N(0,1)
             if (Math.abs(mean) > 0.1 || Math.abs(std - 1.0) > 0.2) {

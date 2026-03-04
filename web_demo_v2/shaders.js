@@ -78,44 +78,49 @@ struct VsOut {
     return out;
 }
 
-@group(0) @binding(0) var noiseTex:  texture_2d<f32>;
+// Noise read directly from storage buffer (no texture copy needed)
+@group(0) @binding(0) var<storage, read> noiseData: array<f32>;
 @group(0) @binding(1) var colorTex:  texture_2d<f32>;
 @group(0) @binding(2) var motionTex: texture_2d<f32>;
 
 struct DisplayUniforms {
     mode: u32,
+    W:    u32,
+    H:    u32,
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
 
+fn readNoise(col: u32, row: u32) -> vec4f {
+    let idx = (row * disp.W + col) * 4u;
+    return vec4f(noiseData[idx], noiseData[idx+1u], noiseData[idx+2u], noiseData[idx+3u]);
+}
+
 @fragment fn fs(in: VsOut) -> @location(0) vec4f {
     let uv = in.texcoord;
-    let dims = vec2f(textureDimensions(noiseTex));
-    let px = vec2u(uv * dims);
+    let W = disp.W;
+    let H = disp.H;
+    let col = min(u32(uv.x * f32(W)), W - 1u);
+    let row = min(u32(uv.y * f32(H)), H - 1u);
 
     if (disp.mode == 0u) {
-        // Noise: scale to visible range
-        let n = textureLoad(noiseTex, px, 0);
+        let n = readNoise(col, row);
         return vec4f(n.rgb / 5.0 + 0.5, 1.0);
     } else if (disp.mode == 1u) {
-        // Color
-        return textureLoad(colorTex, px, 0);
+        return textureLoad(colorTex, vec2u(col, row), 0);
     } else if (disp.mode == 2u) {
-        // Motion
-        let mv = textureLoad(motionTex, px, 0).rg;
+        let mv = textureLoad(motionTex, vec2u(col, row), 0).rg;
         return vec4f(mv * 5.0 + 0.5, 0.5, 1.0);
     } else if (disp.mode == 3u) {
-        // Side-by-side: left=color, right=noise
         if (uv.x < 0.5) {
-            let suv = vec2u(vec2f(uv.x * 2.0, uv.y) * dims);
-            return textureLoad(colorTex, suv, 0);
+            let sc = min(u32(uv.x * 2.0 * f32(W)), W - 1u);
+            return textureLoad(colorTex, vec2u(sc, row), 0);
         } else {
-            let suv = vec2u(vec2f((uv.x - 0.5) * 2.0, uv.y) * dims);
-            let n = textureLoad(noiseTex, suv, 0);
+            let sc = min(u32((uv.x - 0.5) * 2.0 * f32(W)), W - 1u);
+            let n = readNoise(sc, row);
             return vec4f(n.rgb / 5.0 + 0.5, 1.0);
         }
     } else {
-        // Raw noise
-        let n = textureLoad(noiseTex, px, 0);
+        let n = readNoise(col, row);
         return vec4f(n.rgb, 1.0);
     }
 }
@@ -216,8 +221,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
 export const brownianWGSL = /* wgsl */`
 const MAX_TICKETS: u32 = 24u;
-const C: u32 = 4u;
 const EPS: f32 = 1e-6;
+const TWO_PI: f32 = 6.283185307;
 
 struct Uniforms {
     H:         u32,
@@ -227,30 +232,42 @@ struct Uniforms {
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read>       ticketCount:    array<i32>;
-@group(0) @binding(2) var<storage, read>       masterField:    array<i32>;
-@group(0) @binding(3) var<storage, read>       areaField:      array<f32>;
-@group(0) @binding(4) var<storage, read>       noise:          array<f32>;
-@group(0) @binding(5) var<storage, read_write> bufferAtomic:   array<atomic<u32>>;
+@group(0) @binding(1) var<storage, read>       ticketCount:     array<i32>;
+@group(0) @binding(2) var<storage, read>       masterField:     array<i32>;
+@group(0) @binding(3) var<storage, read>       areaField:       array<f32>;
+@group(0) @binding(4) var<storage, read>       noise:           array<f32>;
+@group(0) @binding(5) var<storage, read_write> bufferAtomic:    array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> pixelAreaAtomic: array<atomic<u32>>;
 
-// PCG hash for PRNG
 fn pcg(v: u32) -> u32 {
     var state = v * 747796405u + 2891336453u;
     let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
 }
 
-// Generate standard normal sample from a seed (Box-Muller, discard spare)
-fn randn(seed: u32) -> f32 {
-    let h1 = pcg(seed);
-    let h2 = pcg(seed ^ 0xDEADBEEFu);
-    let u1 = max(f32(h1) / 4294967296.0, 1e-10);
-    let u2 = f32(h2) / 4294967296.0;
-    return sqrt(-2.0 * log(u1)) * cos(6.283185307 * u2);
+// Generate 4 normal samples via 2 Box-Muller pairs (uses both sin+cos)
+fn randn4(state: ptr<function, u32>) -> vec4f {
+    *state = pcg(*state);
+    let h1a = pcg(*state);
+    *state = pcg(*state + 1u);
+    let h2a = pcg(*state);
+    let u1a = max(f32(h1a) / 4294967296.0, 1e-10);
+    let u2a = f32(h2a) / 4294967296.0;
+    let ra = sqrt(-2.0 * log(u1a));
+    let th_a = TWO_PI * u2a;
+
+    *state = pcg(*state + 1u);
+    let h1b = pcg(*state);
+    *state = pcg(*state + 1u);
+    let h2b = pcg(*state);
+    let u1b = max(f32(h1b) / 4294967296.0, 1e-10);
+    let u2b = f32(h2b) / 4294967296.0;
+    let rb = sqrt(-2.0 * log(u1b));
+    let th_b = TWO_PI * u2b;
+
+    return vec4f(ra * cos(th_a), ra * sin(th_a), rb * cos(th_b), rb * sin(th_b));
 }
 
-// Float atomic add via compare-and-swap loop
 fn atomicAddF32(addr: ptr<storage, atomic<u32>, read_write>, val: f32) {
     var old = atomicLoad(addr);
     loop {
@@ -261,7 +278,9 @@ fn atomicAddF32(addr: ptr<storage, atomic<u32>, read_write>, val: f32) {
     }
 }
 
-@compute @workgroup_size(256)
+override WG_SIZE: u32 = 256;
+
+@compute @workgroup_size(WG_SIZE)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let srcIdx = gid.x;
     if (srcIdx >= u.H * u.W) { return; }
@@ -269,7 +288,6 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let nTickets = ticketCount[srcIdx];
     if (nTickets <= 0) { return; }
 
-    // Sum total request weight
     let ticketBase = srcIdx * MAX_TICKETS;
     var totalRequest: f32 = 0.0;
     for (var k: i32 = 0; k < nTickets; k = k + 1) {
@@ -277,12 +295,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
     if (totalRequest <= 0.0) { return; }
 
-    // Brownian bridge sampling
+    // Vectorized Brownian bridge — operate on all 4 channels as vec4f
     var pastRange: f32 = 0.0;
-    var pastValue: array<f32, 4>;
-
-    // PRNG state: unique per source pixel per frame
+    var pv = vec4f(0.0);  // pastValue for all 4 channels
     var randState: u32 = pcg(u.frameSeed * 104729u + srcIdx);
+
+    let srcBase = srcIdx * 4u;
+    let srcNoise = vec4f(noise[srcBase], noise[srcBase+1u], noise[srcBase+2u], noise[srcBase+3u]);
 
     for (var k: i32 = 0; k < nTickets; k = k + 1) {
         let w = areaField[ticketBase + u32(k)];
@@ -290,32 +309,31 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         let normalizedW = w / totalRequest;
         let nextRange = pastRange + normalizedW;
 
-        let srcBase = srcIdx * C;
-        let destBase = destIdx * C;
+        var nv: vec4f;  // nextValue
 
-        for (var c: u32 = 0u; c < C; c = c + 1u) {
-            let x = noise[srcBase + c];
-            var nextValue: f32;
+        if (nextRange >= 1.0 || (1.0 - pastRange) <= EPS) {
+            nv = srcNoise;
+        } else {
+            let denom = 1.0 - pastRange;
+            let a = (1.0 - nextRange) / denom;
+            let b = (nextRange - pastRange) / denom;
+            let mu4 = a * pv + b * srcNoise;
+            let variance = (nextRange - pastRange) * (1.0 - nextRange) / denom;
+            let stddev = sqrt(max(0.0, variance));
 
-            if (nextRange >= 1.0 || (1.0 - pastRange) <= EPS) {
-                nextValue = x;
-            } else {
-                let denom = 1.0 - pastRange;
-                let mu = (1.0 - nextRange) / denom * pastValue[c]
-                       + (nextRange - pastRange) / denom * x;
-                let variance = (nextRange - pastRange) * (1.0 - nextRange) / denom;
-
-                randState = pcg(randState + c);
-                let r = randn(randState);
-                nextValue = r * sqrt(max(0.0, variance)) + mu;
-            }
-
-            let currValue = nextValue - pastValue[c];
-            atomicAddF32(&bufferAtomic[destBase + c], currValue);
-            pastValue[c] = nextValue;
+            let r4 = randn4(&randState);
+            nv = r4 * stddev + mu4;
         }
 
+        let cv = nv - pv;  // currValue
+        let destBase = destIdx * 4u;
+        atomicAddF32(&bufferAtomic[destBase],      cv.x);
+        atomicAddF32(&bufferAtomic[destBase + 1u], cv.y);
+        atomicAddF32(&bufferAtomic[destBase + 2u], cv.z);
+        atomicAddF32(&bufferAtomic[destBase + 3u], cv.w);
+
         atomicAddF32(&pixelAreaAtomic[destIdx], normalizedW);
+        pv = nv;
         pastRange = nextRange;
     }
 }

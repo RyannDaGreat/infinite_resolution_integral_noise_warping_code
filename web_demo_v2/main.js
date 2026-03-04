@@ -120,6 +120,9 @@ class SpinningCube {
 // ---------------------------------------------------------------------------
 
 async function main() {
+    // URL params for benchmark tuning (e.g. ?brownian_wg=128)
+    const params = new URLSearchParams(window.location.search);
+
     const canvas = document.getElementById('canvas');
     canvas.width = WIDTH;
     canvas.height = HEIGHT;
@@ -138,6 +141,8 @@ async function main() {
     let renderer;
     try {
         renderer = new WebGPURenderer(canvas, WIDTH, HEIGHT);
+        const brownianWG = parseInt(params.get('brownian_wg')) || 256;
+        renderer.brownianWGOverride = brownianWG;
         await renderer.init();
     } catch (e) {
         errorEl.textContent = e.message;

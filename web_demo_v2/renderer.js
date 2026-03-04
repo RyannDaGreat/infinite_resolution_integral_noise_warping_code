@@ -110,15 +110,9 @@ export class WebGPURenderer {
             size: [W, H], format: 'depth24plus',
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
-        this.noiseDispTex = device.createTexture({
-            size: [W, H], format: 'rgba32float',
-            usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
-        });
-
         this.colorTexView  = this.colorTex.createView();
         this.motionTexView = this.motionTex.createView();
         this.depthTexView  = this.depthTex.createView();
-        this.noiseDispTexView = this.noiseDispTex.createView();
     }
 
     _createBuffers() {
@@ -230,14 +224,17 @@ export class WebGPURenderer {
         });
 
         // Compute pipelines
-        const computePipeline = (module) => device.createComputePipeline({
+        const computePipeline = (module, constants) => device.createComputePipeline({
             layout: 'auto',
-            compute: { module, entryPoint: 'main' },
+            compute: { module, entryPoint: 'main', ...(constants ? { constants } : {}) },
         });
+
+        // Brownian workgroup size — parameterized for tuning via URL ?brownian_wg=N
+        this.brownianWG = this.brownianWGOverride || 256;
 
         this.buildDeformPipeline = computePipeline(buildDeformMod);
         this.backwardMapPipeline = computePipeline(backwardMapMod);
-        this.brownianPipeline    = computePipeline(brownianMod);
+        this.brownianPipeline    = computePipeline(brownianMod, { WG_SIZE: this.brownianWG });
         this.normalizePipeline   = computePipeline(normalizeMod);
     }
 
@@ -255,11 +252,11 @@ export class WebGPURenderer {
             entries: [{ binding: 0, resource: buf(this.cubeUniformBuf) }],
         });
 
-        // Display bind group
+        // Display bind group — reads noise from storage buffer directly (no texture copy)
         this.displayBindGroup = device.createBindGroup({
             layout: this.displayPipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: this.noiseDispTexView },
+                { binding: 0, resource: buf(this.noiseBuf) },
                 { binding: 1, resource: this.colorTexView },
                 { binding: 2, resource: this.motionTexView },
                 { binding: 3, resource: buf(this.displayUniformBuf) },
@@ -358,13 +355,7 @@ export class WebGPURenderer {
         for (let i = 0; i < data.length; i++) data[i] = randn();
         device.queue.writeBuffer(this.noiseBuf, 0, data);
 
-        // Also copy to display texture for first frame
-        device.queue.writeTexture(
-            { texture: this.noiseDispTex },
-            data,
-            { bytesPerRow: W * C * 4, rowsPerImage: H },
-            { width: W, height: H },
-        );
+        // Display reads noise directly from noiseBuf — no texture copy needed
     }
 
     // -----------------------------------------------------------------------
@@ -385,7 +376,8 @@ export class WebGPURenderer {
      */
     frame({ model, viewProj, prevModel, prevViewProj, displayMode, frameSeed }) {
         const { device, W, H, N } = this;
-        const workgroups = Math.ceil(N / 256);
+        const workgroups256 = Math.ceil(N / 256);
+        const brownianWGs = Math.ceil(N / this.brownianWG);
 
         // Update uniforms — floor uses identity model
         const IDENTITY = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
@@ -406,7 +398,7 @@ export class WebGPURenderer {
         device.queue.writeBuffer(this.computeUniformBuf, 0,
             new Uint32Array([H, W, frameSeed, 0]));
         device.queue.writeBuffer(this.displayUniformBuf, 0,
-            new Uint32Array([displayMode]));
+            new Uint32Array([displayMode, W, H, 0]));
 
         const encoder = device.createCommandEncoder();
 
@@ -463,7 +455,7 @@ export class WebGPURenderer {
         );
         deformPass.setPipeline(this.buildDeformPipeline);
         deformPass.setBindGroup(0, this.buildDeformBindGroup);
-        deformPass.dispatchWorkgroups(workgroups);
+        deformPass.dispatchWorkgroups(workgroups256);
         deformPass.end();
 
         // --- Clear intermediate buffers ---
@@ -483,7 +475,7 @@ export class WebGPURenderer {
         );
         bwdPass.setPipeline(this.backwardMapPipeline);
         bwdPass.setBindGroup(0, this.backwardMapBindGroup);
-        bwdPass.dispatchWorkgroups(workgroups);
+        bwdPass.dispatchWorkgroups(workgroups256);
         bwdPass.end();
 
         // --- Pass 3: Brownian bridge (compute) ---
@@ -498,7 +490,7 @@ export class WebGPURenderer {
         );
         brPass.setPipeline(this.brownianPipeline);
         brPass.setBindGroup(0, this.brownianBindGroup);
-        brPass.dispatchWorkgroups(workgroups);
+        brPass.dispatchWorkgroups(brownianWGs);
         brPass.end();
 
         // --- Pass 4: Normalize (compute) ---
@@ -513,17 +505,10 @@ export class WebGPURenderer {
         );
         normPass.setPipeline(this.normalizePipeline);
         normPass.setBindGroup(0, this.normalizeBindGroup);
-        normPass.dispatchWorkgroups(workgroups);
+        normPass.dispatchWorkgroups(workgroups256);
         normPass.end();
 
-        // --- Copy noise buffer → display texture ---
-        encoder.copyBufferToTexture(
-            { buffer: this.noiseBuf, bytesPerRow: W * this.C * 4, rowsPerImage: H },
-            { texture: this.noiseDispTex },
-            { width: W, height: H },
-        );
-
-        // --- Pass 5: Display render ---
+        // --- Pass 5: Display render (reads noise from storage buffer, no copy needed) ---
         const canvasView = this.ctx.getCurrentTexture().createView();
         const dispPass = encoder.beginRenderPass({
             colorAttachments: [{
