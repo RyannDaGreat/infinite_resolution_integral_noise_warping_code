@@ -25,22 +25,24 @@ All storage buffers stay GPU-resident. No readPixels, no texSubImage2D.
 Implementation: backup noiseBuf → run blue noise (modifies noiseBuf for display) → display → restore noiseBuf from backup.
 
 ### Blue Noise Algorithm
-Port of `rp.convert_to_blue_noise` — alternating projections:
-1. **Sort initial values** (counting sort: quantize → atomicAdd histogram → prefix sum → scatter)
-2. **For each iteration:**
+Port of `rp.convert_to_blue_noise` — iterative high-pass with σ_hp rescaling:
+1. **For each iteration (2, 5, or 10 — user configurable):**
    a. Separable Gaussian high-pass: blur H→V→subtract = `x - gaussian_blur(x, sigma)`
-   b. Counting sort on high-passed values
-   c. Histogram matching: assign sorted target values by high-pass rank
+   b. Rescale by `1/σ_hp[i]` to maintain unit variance
 
-Key math: FFT high-pass `H(u,v) = 1 - exp(-d²/(2D₀²))` is equivalent to spatial `x - gaussian_blur(x, sigma)` where `sigma = N/(2π·D₀)`. At cutoff_divider=8, sigma≈1.27, kernel radius=4 (9 taps). Much cheaper than 2D FFT.
+Key insight: **For Gaussian inputs, histogram matching is equivalent to dividing by σ_hp.** This eliminates all sorting infrastructure (histogram count, prefix sum, scatter sort, scatter match — 4 shaders removed).
 
-### Blue Noise LUT Optimization (PLANNED)
-The sorting step is expensive. Since the distribution is large (~4M samples at 2048²), the mapping from Gaussian to blue noise values should be stable across frames. Plan:
-1. Run full blue noise conversion on first frame (or a reference frame)
-2. Record the value→value mapping as a lookup table (e.g., 4096 entries)
-3. On subsequent frames, apply the LUT instead of sorting — O(1) per pixel instead of O(N) total
-4. The LUT should be generated programmatically at init time, not hardcoded
-5. Since blue noise doesn't feed back into warp, approximate distribution is acceptable
+The per-iteration sigma table is **resolution-independent** (verified 256-2048, max diff < 0.002) because `sigma_spatial = cutoff_divider / (2π)` depends only on `cutoff_divider`, not resolution:
+```javascript
+const BN_INV_SIGMA_TABLE = [
+    1.083608, 1.035389, 1.023437, 1.017777, 1.014435,
+    1.012213, 1.010624, 1.009426, 1.008490, 1.007737,
+];
+```
+
+Validation: rank correlation vs rp reference = 0.999994, std after 10 iters = 0.9994.
+
+**Greyscale optimization**: When greyscale mode is on, blur processes only channel 0 (scalar reads) — ~75% less memory bandwidth.
 
 ### Gaussian→Uniform Display
 Uses Abramowitz & Stegun erf approximation (error < 1.5e-7) to apply normal CDF, mapping Gaussian values to uniform [0,1] for better visualization. Toggle via U key or button.
@@ -64,8 +66,9 @@ All settings saved to localStorage (`iinw_v2_settings`), restored on page load.
 | Button | Hotkey | Description |
 |--------|--------|-------------|
 | Resolution | R | Cycle 2048→1024→512→256 (recreates renderer) |
-| Blue Noise | B | Toggle blue noise post-processing (10 iterations) |
-| Grey | G | Greyscale display (show channel 0 only) |
+| Blue Noise | B | Toggle blue noise post-processing |
+| BN×N | N | Cycle blue noise iterations: 2→5→10 (fewer = faster) |
+| Grey | G | Greyscale display (channel 0 only, enables scalar blue noise) |
 | Uniform | U | Gaussian→Uniform display via normal CDF |
 | Retina | T | Toggle retina/HiDPI CSS scaling |
 | Interp | I | Toggle CSS interpolation: bilinear vs nearest-neighbor |
@@ -73,13 +76,13 @@ All settings saved to localStorage (`iinw_v2_settings`), restored on page load.
 
 ## Performance (M4 Mac, 2048×2048)
 - Without blue noise: ~22ms total GPU (~46fps)
-- With blue noise (10 iter): ~62ms total GPU (~16fps)
+- With blue noise (10 iter, vec4): ~20 dispatches, memory-bandwidth limited
+- With blue noise (2 iter, greyscale): ~4 dispatches, much faster
 - Brownian bridge is the compute bottleneck (~12ms at 2048²)
 
 ## Key Constraints
 - Float atomics in WGSL via atomicCompareExchangeWeak CAS loop on u32 reinterpretation
 - MAX_TICKETS = 24 per source pixel (masterField + areaField = ~50MB at 2048²)
-- Prefix sum for histogram is serial (1 thread per channel, 4096 bins) — could parallelize but negligible cost
 - Stats readback every 60 frames via async mapAsync — doesn't stall render
 - GPU timestamp queries for per-phase profiling (when available)
 
@@ -88,3 +91,6 @@ All settings saved to localStorage (`iinw_v2_settings`), restored on page load.
 - Moving pixelArea from atomic scatter (brownian) to deterministic recomputation (normalize) improved brownian min-latency significantly.
 - 1-ticket fast path in brownian: marginal impact since most pixels have ~4 tickets (bilinear).
 - Blue noise MUST be post-processing only — feeding it back corrupts the warp (std elevated, visible artifacts).
+- **Sorting → σ_hp rescaling**: For Gaussian inputs, histogram matching = dividing by σ_hp. Eliminated 4 shaders, ~284 lines. Per-iteration sigma table is resolution-independent.
+- **σ_hp is NOT constant**: drifts from 0.923 (iter 0) to 0.992 (iter 9) as spectrum evolves from white to blue. Using a fixed constant causes std to blow up to 1.78. Must use per-iteration table.
+- **Greyscale scalar path**: Processing only channel 0 reduces blur memory bandwidth by ~75%.
