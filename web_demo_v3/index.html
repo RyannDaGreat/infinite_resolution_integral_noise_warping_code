@@ -85,6 +85,12 @@
         <button id="timeSunset" title="Set time: Sunset"><iconify-icon icon="mdi:weather-sunset" width="14"></iconify-icon></button>
         <button id="timeNight" title="Set time: Night"><iconify-icon icon="mdi:weather-night" width="14"></iconify-icon></button>
         <button id="timeDawn" title="Set time: Dawn"><iconify-icon icon="mdi:weather-sunset-up" width="14"></iconify-icon></button>
+        <input type="range" id="daySpeedSlider" min="0" max="300" value="20" title="Day/night cycle speed (0=frozen, 100=1x, 300=3x)" style="width:80px; vertical-align:middle; accent-color:#48c;">
+        <span id="daySpeedLabel" style="font-size:11px; min-width:30px; display:inline-block;">0.2x</span>
+        <span class="sep">|</span>
+        <button id="pointLightsBtn" title="Toggle point lights from spheres/mushrooms">Lights: ON</button>
+        <button id="terrainBtn" title="Toggle terrain mesh rendering">Terrain: ON</button>
+        <button id="shadowResBtn" title="Cycle shadow map resolution">Shadow: 4096</button>
         <button id="resetBtn" title="Reset all settings to defaults">Defaults</button>
         <span id="modeSettings" style="display:none;">
             <span class="sep">|</span>

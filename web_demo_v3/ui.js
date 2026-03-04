@@ -7,8 +7,9 @@ const RESOLUTIONS = [2048, 1024, 512, 256];
 const BN_ITERS_OPTIONS = [2, 5, 10];
 const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw'];
 const ROUND_MODES = ['None', 'All', '>1'];
+const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 1;
+const SETTINGS_VERSION = 2;
 
 const DEFAULTS = {
     resIdx: 1,          // 1024 default for V3 (physics is heavier)
@@ -23,6 +24,10 @@ const DEFAULTS = {
     roundMode: 0,
     noiseOpacity: 25,   // 0-100 → 0.0-1.0
     shadows: true,
+    pointLights: true,
+    terrain: true,
+    shadowResIdx: 3,    // 4096 default
+    daySpeed: 20,       // 0-300 → 0.0-3.0 multiplier (20 = 0.2x = 5x slower)
 };
 
 function loadSettings() {
@@ -74,6 +79,11 @@ export class UIManager {
         this.statsEl = document.getElementById('stats');
 
         this.shadowsBtn = document.getElementById('shadowsBtn');
+        this.pointLightsBtn = document.getElementById('pointLightsBtn');
+        this.terrainBtn = document.getElementById('terrainBtn');
+        this.shadowResBtn = document.getElementById('shadowResBtn');
+        this.daySpeedSlider = document.getElementById('daySpeedSlider');
+        this.daySpeedLabel = document.getElementById('daySpeedLabel');
 
         this.slowMo = false;
         this.noiseLocked = false;
@@ -113,6 +123,14 @@ export class UIManager {
         this.lockNoiseBtn.classList.toggle('on', this.noiseLocked);
         this.shadowsBtn.textContent = `[V] Shadows: ${s.shadows ? 'ON' : 'OFF'}`;
         this.shadowsBtn.classList.toggle('on', s.shadows);
+        this.pointLightsBtn.textContent = `Lights: ${s.pointLights ? 'ON' : 'OFF'}`;
+        this.pointLightsBtn.classList.toggle('on', s.pointLights);
+        this.terrainBtn.textContent = `Terrain: ${s.terrain ? 'ON' : 'OFF'}`;
+        this.terrainBtn.classList.toggle('on', s.terrain);
+        this.shadowResBtn.textContent = `Shadow: ${SHADOW_RES_OPTIONS[s.shadowResIdx]}`;
+        this.shadowResBtn.classList.toggle('on', s.shadowResIdx > 2);
+        this.daySpeedSlider.value = s.daySpeed;
+        this.daySpeedLabel.textContent = `${(s.daySpeed / 100).toFixed(1)}x`;
         // Noise opacity slider (visible only in S+N mode)
         this.modeSettingsEl.style.display = (this.displayMode === 2) ? 'inline' : 'none';
         this.noiseOpacitySlider.value = s.noiseOpacity;
@@ -139,6 +157,9 @@ export class UIManager {
         renderer.noiseOpacity = s.noiseOpacity / 100;
         renderer.noiseLocked = this.noiseLocked;
         renderer.shadowsEnabled = s.shadows;
+        renderer.pointLightsEnabled = s.pointLights;
+        renderer.terrainEnabled = s.terrain;
+        renderer.daySpeedMultiplier = s.daySpeed / 100;
     }
 
     /**
@@ -199,6 +220,16 @@ export class UIManager {
             s.noiseOpacity = parseInt(this.noiseOpacitySlider.value); update();
         });
         this.shadowsBtn.addEventListener('click', () => { s.shadows = !s.shadows; update(); });
+        this.pointLightsBtn.addEventListener('click', () => { s.pointLights = !s.pointLights; update(); });
+        this.terrainBtn.addEventListener('click', () => { s.terrain = !s.terrain; update(); });
+        this.shadowResBtn.addEventListener('click', () => {
+            s.shadowResIdx = (s.shadowResIdx + 1) % SHADOW_RES_OPTIONS.length;
+            this._persist(); this.syncUI();
+            this.callbacks.onShadowResChange?.(SHADOW_RES_OPTIONS[s.shadowResIdx]);
+        });
+        this.daySpeedSlider.addEventListener('input', () => {
+            s.daySpeed = parseInt(this.daySpeedSlider.value); update();
+        });
         // Mode bar buttons
         for (const btn of this.modeBtns) {
             btn.addEventListener('click', () => {

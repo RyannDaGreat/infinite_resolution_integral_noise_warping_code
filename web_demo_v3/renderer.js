@@ -169,6 +169,10 @@ export class WebGPURenderer {
         this.noiseLocked = false;
         this._wasLocked = false;
         this.shadowsEnabled = true;
+        this.shadowResolution = 4096;
+        this.pointLightsEnabled = true;
+        this.terrainEnabled = true;
+        this.daySpeedMultiplier = 0.2;  // 5x slower than original (1500-sec cycle)
     }
 
     async init() {
@@ -238,9 +242,9 @@ export class WebGPURenderer {
             size: [W, H], format: 'depth24plus',
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
-        // Shadow map: 4096×4096 depth texture, sampled in scene shader for PCF.
+        // Shadow map: configurable resolution depth texture, sampled in scene shader for PCF.
         this.shadowTex = device.createTexture({
-            size: [4096, 4096], format: 'depth32float',
+            size: [this.shadowResolution, this.shadowResolution], format: 'depth32float',
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
         this.colorTexView  = this.colorTex.createView();
@@ -580,7 +584,7 @@ export class WebGPURenderer {
         const bevelData = beveledBoxVertices(0.75, 1.5, 0.18, 0.04, 2);
         const sphereData = sphereVertices();
         const quadData = quadVertices();
-        const terrainData = terrainMeshVertices(2400, 4500);
+        const terrainData = terrainMeshVertices(600, 4500);
 
         this.boxVB = uploadVB(boxData);
         this.boxVertCount = boxData.length / 6;
@@ -716,11 +720,11 @@ export class WebGPURenderer {
         const workgroups256 = Math.ceil(N / 256);
         const brownianWGs = Math.ceil(N / this.brownianWG);
 
-        // Day/night cycle: one full cycle every 5 minutes (300 seconds).
-        // angle=0 → sun at horizon rising; angle=π/2 → solar noon; angle=π → setting; angle>π → night.
+        // Day/night cycle: base period 300 seconds, scaled by daySpeedMultiplier.
+        // daySpeedMultiplier=0 freezes time; 1.0 = original 5-min cycle; 3.0 = 100s cycle.
         const DAY_CYCLE_SECS = 300;
-        // Start at solar noon (π/2 offset so sun is overhead at t=0)
-        const angle = (2 * Math.PI * elapsedSecs) / DAY_CYCLE_SECS + Math.PI / 2;
+        const effectiveSecs = elapsedSecs * this.daySpeedMultiplier;
+        const angle = (2 * Math.PI * effectiveSecs) / DAY_CYCLE_SECS + Math.PI / 2;
         // sunDir: x=cos(angle) sweeps east→west, y=sin(angle) rises/sets, z=slight tilt north
         const rawX = Math.cos(angle);
         const rawY = Math.sin(angle);
@@ -757,7 +761,7 @@ export class WebGPURenderer {
         // Upload point lights: count(u32) + 3 pad(u32) + 32 × (posAndRadius vec4f + color vec4f)
         const lightData = new Float32Array(4 + 32 * 8);  // 260 floats = 1040 bytes
         const lightU32 = new Uint32Array(lightData.buffer);
-        const numLights = Math.min(lights.length, 32);
+        const numLights = this.pointLightsEnabled ? Math.min(lights.length, 32) : 0;
         lightU32[0] = numLights;
         for (let i = 0; i < numLights; i++) {
             const base = 4 + i * 8;
@@ -838,8 +842,10 @@ export class WebGPURenderer {
             }
 
             // Terrain
-            shadowPass.setVertexBuffer(0, this.terrainVB);
-            shadowPass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
+            if (this.terrainEnabled) {
+                shadowPass.setVertexBuffer(0, this.terrainVB);
+                shadowPass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
+            }
 
             shadowPass.end();
         } else {
@@ -902,8 +908,10 @@ export class WebGPURenderer {
         }
 
         // Draw terrain mesh: single non-instanced draw at TERRAIN_INSTANCE_IDX
-        scenePass.setVertexBuffer(0, this.terrainVB);
-        scenePass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
+        if (this.terrainEnabled) {
+            scenePass.setVertexBuffer(0, this.terrainVB);
+            scenePass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
+        }
 
         scenePass.end();
 
@@ -1078,6 +1086,40 @@ export class WebGPURenderer {
             result[p] = { mean, std, n };
         }
         return result;
+    }
+
+    /**
+     * Change the shadow map resolution at runtime. Recreates the shadow texture
+     * and rebinds affected bind groups. Not pure: destroys/creates GPU resources.
+     *
+     * Args:
+     *   newRes (number): New shadow map resolution (e.g., 1024, 2048, 4096, 8192)
+     *
+     * Examples:
+     *   >>> // renderer.setShadowResolution(8192)
+     */
+    setShadowResolution(newRes) {
+        if (newRes === this.shadowResolution) return;
+        this.shadowResolution = newRes;
+
+        this.shadowTex.destroy();
+        this.shadowTex = this.device.createTexture({
+            size: [newRes, newRes], format: 'depth32float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this.shadowTexView = this.shadowTex.createView({ aspect: 'depth-only' });
+
+        const buf = (b) => ({ buffer: b });
+        this.sceneBindGroup = this.device.createBindGroup({
+            layout: this.scenePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.cameraUniformBuf) },
+                { binding: 1, resource: buf(this.instanceBuf) },
+                { binding: 2, resource: this.shadowTexView },
+                { binding: 3, resource: this.shadowSampler },
+                { binding: 4, resource: buf(this.lightUniformBuf) },
+            ],
+        });
     }
 
     _computeNoiseStats(data) {

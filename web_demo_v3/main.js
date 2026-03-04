@@ -52,6 +52,7 @@ async function main() {
         onResetScene: () => { physics.reset(); scene.prevTransforms.clear(); },
         onSlowMo: (on) => { physics.slowMo = on; },
         onSetTime: (targetElapsed) => { startTime = performance.now() - targetElapsed * 1000; },
+        onShadowResChange: (res) => { if (renderer) renderer.setShadowResolution(res); },
     });
 
     async function createRenderer() {
