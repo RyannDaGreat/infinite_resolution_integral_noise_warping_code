@@ -172,3 +172,7 @@ web_demo_v2/test_screenshot.png
 web_demo_v2/perf_screenshot.png
 game_demo/blue_noise_comparison.png
 ..gitignore.un~
+
+.claude/worktrees/
+.claude_todo.md
+.claude_logs/
