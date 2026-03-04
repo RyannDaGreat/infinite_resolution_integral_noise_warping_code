@@ -115,6 +115,33 @@ class Renderer:
         ]
         self.noise_idx = 0  # index of the WRITE target
 
+    def resize(self, width, height):
+        """
+        Recreate FBOs and noise textures for a new resolution.
+
+        Not pure: releases old GPU resources, allocates new ones.
+
+        Args:
+            width (int): New width.
+            height (int): New height.
+
+        Examples:
+            >>> # renderer.resize(400, 300)
+        """
+        self.width = width
+        self.height = height
+        self.ctx.viewport = (0, 0, width, height)
+        self._release_fbos()
+        self._init_fbos()
+        self._init_noise()
+
+    def _release_fbos(self):
+        """Release all FBO and texture GPU resources."""
+        for fbo in [self.scene_fbo] + self.noise_fbo:
+            fbo.release()
+        for tex in [self.color_tex, self.motion_tex, self.depth_tex] + self.noise_tex:
+            tex.release()
+
     def _init_noise(self):
         """Upload initial Gaussian noise to both ping-pong textures."""
         noise = np.random.randn(self.height, self.width, 4).astype(np.float32)

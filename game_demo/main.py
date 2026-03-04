@@ -280,6 +280,25 @@ def run(width=200, height=150, fps=60, mode="glsl", image=None):
                 pygame.event.set_grab(True)
                 pygame.mouse.set_visible(False)
                 mouse_captured = True
+            elif event.type == pygame.VIDEORESIZE:
+                width, height = event.w, event.h
+                pygame.display.set_mode(
+                    (width, height),
+                    pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE,
+                )
+                renderer.resize(width, height)
+                proj = glm.perspective(
+                    glm.radians(60.0), width / height, 0.1, 100.0
+                )
+                if mode == "taichi":
+                    taichi_warper = TaichiWarper(width, height, channels=4)
+                    renderer.upload_noise(taichi_warper.get_init_noise_for_gpu())
+                elif mode == "image":
+                    if image is not None:
+                        img_data = load_image_for_gpu(image, width, height)
+                    else:
+                        img_data = make_test_pattern(width, height)
+                    renderer.upload_noise(img_data)
             elif event.type == pygame.MOUSEMOTION and mouse_captured:
                 camera.process_mouse(event.rel[0], event.rel[1])
 
