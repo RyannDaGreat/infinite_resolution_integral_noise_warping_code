@@ -166,3 +166,8 @@ BLENDER_RESEARCH.md
 game_demo/scratchpad.py
 game_demo/debug_dump
 game_demo/validation
+web_demo_v2/node_modules
+web_demo_v2/test_screenshot.png
+web_demo_v2/perf_screenshot.png
+game_demo/blue_noise_comparison.png
+..gitignore.un~
