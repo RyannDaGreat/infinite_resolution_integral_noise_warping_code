@@ -30,7 +30,9 @@
             position: relative;
             margin-top: 32px;
         }
-        #canvas { border: 1px solid #333; cursor: crosshair; }
+        /* No border/padding on canvas — any inward border makes the CSS size differ from
+           the render resolution, causing pixel misalignment (missed scanlines, ugly moiré). */
+        #canvas { outline: 1px solid #333; cursor: crosshair; }
         .overlay {
             position: absolute; pointer-events: none;
             background: #000a; padding: 4px 8px; color: #aaa;
@@ -54,13 +56,17 @@
         <a href="../web_demo/">V1: WebGL 2 + JS</a>
         <span class="active">V2: WebGPU Compute</span>
         <span class="sep">|</span>
-        <button id="resBtn" title="Cycle render resolution: 2048, 1024, 512, 256 (hotkey: R)">2048</button>
-        <button id="blueNoiseBtn" title="Toggle blue noise post-processing (hotkey: B)">Blue Noise: OFF</button>
-        <button id="bnItersBtn" title="Cycle blue noise iterations: 2, 5, 10 (hotkey: N). Fewer = faster, less blue.">BN×10</button>
-        <button id="greyBtn" title="Toggle greyscale display — show channel 0 only (hotkey: G)">Grey: OFF</button>
-        <button id="uniformBtn" title="Toggle Gaussian→Uniform display mapping via normal CDF (hotkey: U)">Uniform: OFF</button>
-        <button id="retinaBtn" title="Toggle retina/HiDPI scaling (hotkey: T)">Retina: ON</button>
-        <button id="interpBtn" title="Toggle canvas CSS interpolation: bilinear vs nearest-neighbor (hotkey: I)">Interp: Bilinear</button>
+        <button id="resBtn" title="Cycle render resolution: 2048, 1024, 512, 256">[P] 2048</button>
+        <button id="blueNoiseBtn" title="Toggle blue noise post-processing">[B] Blue: OFF</button>
+        <button id="bnItersBtn" title="Cycle blue noise iterations: 2, 5, 10. Fewer = faster, less blue.">[N] BN×10</button>
+        <button id="greyBtn" title="Toggle greyscale display — show channel 0 only">[G] Grey: OFF</button>
+        <button id="uniformBtn" title="Toggle Gaussian→Uniform display mapping via normal CDF">[U] Uniform: ON</button>
+        <button id="retinaBtn" title="Toggle retina/HiDPI scaling">[T] Retina: ON</button>
+        <button id="interpBtn" title="Toggle canvas CSS interpolation: bilinear vs nearest-neighbor">[I] Interp: Nearest</button>
+        <button id="roundBtn" title="Motion rounding: None (fractional), Round All (snap to whole pixels), Round >1 (only round large motion)">[O] Round: None</button>
+        <button id="threshBtn" title="Toggle threshold visualization — shows spatial distribution of extreme noise values">[H] Thresh: OFF</button>
+        <input type="range" id="threshSlider" min="0" max="1000" value="500" disabled title="Drag left for bottom tail, right for top tail" style="width: 120px; vertical-align: middle; accent-color: #48c;">
+        <span id="threshLabel" style="font-size: 11px; min-width: 50px; display: inline-block;"></span>
         <button id="resetBtn" title="Reset all settings to defaults">Reset</button>
     </nav>
 
@@ -73,7 +79,7 @@
             1-5 — display modes | ESC — release mouse<br>
             Space — pause
         </div>
-        <div id="hint" class="overlay">ESC release | 1-5 modes | B blue | N iters | G grey | U uniform | R res | T retina | I interp | Space pause</div>
+        <div id="hint" class="overlay">ESC release | 1-5 modes | B blue | N iters | G grey | U uniform | H thresh | O round | P res | T retina | I interp | Space pause</div>
     </div>
     <div id="error"></div>
 

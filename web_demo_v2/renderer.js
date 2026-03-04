@@ -202,7 +202,7 @@ export class WebGPURenderer {
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.displayUniformBuf = device.createBuffer({
-            size: 16,
+            size: 32,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -550,10 +550,18 @@ export class WebGPURenderer {
         device.queue.writeBuffer(this.cubeUniformBuf, 0, cubeData);
 
         device.queue.writeBuffer(this.computeUniformBuf, 0,
-            new Uint32Array([H, W, frameSeed, 0]));
+            new Uint32Array([H, W, frameSeed, this.roundMode || 0]));
         const displayFlags = (this.greyscaleEnabled ? 1 : 0) | (this.uniformDisplayEnabled ? 2 : 0);
-        device.queue.writeBuffer(this.displayUniformBuf, 0,
-            new Uint32Array([displayMode, W, H, displayFlags]));
+        const displayBuf = new ArrayBuffer(32);
+        const displayU32 = new Uint32Array(displayBuf);
+        const displayF32 = new Float32Array(displayBuf);
+        displayU32[0] = displayMode;
+        displayU32[1] = W;
+        displayU32[2] = H;
+        displayU32[3] = displayFlags;
+        displayU32[4] = this.thresholdOn || 0;
+        displayF32[5] = this.thresholdValue || 0;
+        device.queue.writeBuffer(this.displayUniformBuf, 0, displayBuf);
 
         const encoder = device.createCommandEncoder();
 

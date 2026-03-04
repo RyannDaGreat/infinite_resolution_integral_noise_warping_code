@@ -89,6 +89,8 @@ struct DisplayUniforms {
     W:     u32,
     H:     u32,
     flags: u32,  // bit 0: greyscale, bit 1: Gaussian→uniform (normal CDF)
+    thresholdOn:    u32,  // 0=off, 1=on
+    thresholdValue: f32,  // [0,1] cutoff — pixels with display value > threshold are white
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
 
@@ -123,6 +125,23 @@ fn applyFlags(n: vec4f) -> vec4f {
     return v;
 }
 
+// Compute the displayed pixel value for noise (applies flags + scaling)
+fn noiseToDisplay(col: u32, row: u32) -> vec4f {
+    let n = readNoise(col, row);
+    let v = applyFlags(n);
+    if ((disp.flags & 2u) != 0u) {
+        return vec4f(v.rgb, 1.0);  // uniform mode: already [0,1]
+    }
+    return vec4f(v.rgb / 5.0 + 0.5, 1.0);  // Gaussian: scale to ~[0,1] for display
+}
+
+// Apply threshold: pixels above threshold → white, below → black
+fn applyThreshold(color: vec4f) -> vec4f {
+    if (disp.thresholdOn == 0u) { return color; }
+    let val = color.r;  // threshold on displayed channel 0
+    return select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(1.0, 1.0, 1.0, 1.0), val > disp.thresholdValue);
+}
+
 @fragment fn fs(in: VsOut) -> @location(0) vec4f {
     let uv = in.texcoord;
     let W = disp.W;
@@ -131,12 +150,7 @@ fn applyFlags(n: vec4f) -> vec4f {
     let row = min(u32(uv.y * f32(H)), H - 1u);
 
     if (disp.mode == 0u) {
-        let n = readNoise(col, row);
-        let v = applyFlags(n);
-        if ((disp.flags & 2u) != 0u) {
-            return vec4f(v.rgb, 1.0);
-        }
-        return vec4f(v.rgb / 5.0 + 0.5, 1.0);
+        return applyThreshold(noiseToDisplay(col, row));
     } else if (disp.mode == 1u) {
         return textureLoad(colorTex, vec2u(col, row), 0);
     } else if (disp.mode == 2u) {
@@ -148,17 +162,10 @@ fn applyFlags(n: vec4f) -> vec4f {
             return textureLoad(colorTex, vec2u(sc, row), 0);
         } else {
             let sc = min(u32((uv.x - 0.5) * 2.0 * f32(W)), W - 1u);
-            let n = readNoise(sc, row);
-            let v = applyFlags(n);
-            if ((disp.flags & 2u) != 0u) {
-                return vec4f(v.rgb, 1.0);
-            }
-            return vec4f(v.rgb / 5.0 + 0.5, 1.0);
+            return applyThreshold(noiseToDisplay(sc, row));
         }
     } else {
-        let n = readNoise(col, row);
-        let v = applyFlags(n);
-        return vec4f(v.rgb, 1.0);
+        return applyThreshold(noiseToDisplay(col, row));
     }
 }
 `;
@@ -169,13 +176,28 @@ fn applyFlags(n: vec4f) -> vec4f {
 
 export const buildDeformWGSL = /* wgsl */`
 struct Uniforms {
-    H: u32,
-    W: u32,
+    H:         u32,
+    W:         u32,
+    frameSeed: u32,
+    roundMode: u32,  // 0=none, 1=round all motion to nearest pixel, 2=round only if |motion| > 1px
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var motionTex: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read_write> deformation: array<f32>;
+
+// Round a pixel-space motion value based on roundMode:
+// 0: no rounding — fractional pixel motion preserved
+// 1: round to nearest integer — snaps all motion to whole pixels
+// 2: round only if |val| > 1 — sub-pixel motion preserved, large motion quantized
+fn applyRounding(val: f32) -> f32 {
+    if (u.roundMode == 1u) {
+        return round(val);
+    } else if (u.roundMode == 2u) {
+        if (abs(val) > 1.0) { return round(val); }
+    }
+    return val;
+}
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -186,15 +208,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let col = idx % u.W;
 
     let motion = textureLoad(motionTex, vec2u(col, row), 0);
-    let mvX = motion.r;  // horizontal displacement (UV space)
-    let mvY = motion.g;  // vertical displacement (UV space, up = positive)
+    // Convert UV-space motion to pixel-space, apply rounding, then compute source position
+    let dxPx = applyRounding(motion.r * f32(u.W));  // horizontal pixels
+    let dyPx = applyRounding(motion.g * f32(u.H));  // vertical pixels
 
     // Backward deformation: dest pixel → source position (row, col)
     // Identity cell center = (row + 0.5, col + 0.5)
     // mvY > 0 means object moved up → source was below → larger row
     // mvX > 0 means object moved right → source was left → smaller col
-    deformation[idx * 2u]      = f32(row) + 0.5 + mvY * f32(u.H);
-    deformation[idx * 2u + 1u] = f32(col) + 0.5 - mvX * f32(u.W);
+    deformation[idx * 2u]      = f32(row) + 0.5 + dyPx;
+    deformation[idx * 2u + 1u] = f32(col) + 0.5 - dxPx;
 }
 `;
 

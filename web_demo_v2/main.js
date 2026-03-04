@@ -10,7 +10,9 @@ const { mat4, vec3, glMatrix } = window.glMatrix;
 const RESOLUTIONS = [2048, 1024, 512, 256];
 const BN_ITERS_OPTIONS = [2, 5, 10];
 const MODE_NAMES = ['noise', 'color', 'motion', 'side-by-side', 'raw'];
+const ROUND_MODES = ['None', 'All', '>1'];  // 0=none, 1=round all, 2=round if >1px
 const STORAGE_KEY = 'iinw_v2_settings';
+const SETTINGS_VERSION = 5;  // bump to force-reset when defaults change
 
 // ---------------------------------------------------------------------------
 // Settings persistence
@@ -21,20 +23,25 @@ const DEFAULTS = {
     blueNoise: false,
     bnItersIdx: 2,  // index into BN_ITERS_OPTIONS (default: 10)
     greyscale: false,
-    uniformDisplay: false,
+    uniformDisplay: true,
     retina: true,
-    bilinear: true,
+    bilinear: false,
+    threshOn: false,
+    threshSlider: 500,  // [0,1000] → [0.0, 1.0] threshold value (0.50 = half)
+    roundMode: 0,       // 0=none, 1=round all, 2=round if >1px
 };
+
 
 function loadSettings() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULTS };
     const saved = JSON.parse(raw);
+    if (saved._version !== SETTINGS_VERSION) return { ...DEFAULTS };
     return { ...DEFAULTS, ...saved };
 }
 
 function saveSettings(s) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...s, _version: SETTINGS_VERSION }));
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +178,7 @@ async function main() {
     let blueNoiseOn = settings.blueNoise;
     let bnItersIdx = settings.bnItersIdx;
     let bnIters = BN_ITERS_OPTIONS[bnItersIdx];
+    let roundMode = settings.roundMode;
     let renderer = null;
     let displayMode = 0;
     let frameSeed = 42;
@@ -183,22 +191,52 @@ async function main() {
     const uniformBtn = document.getElementById('uniformBtn');
     const retinaBtn = document.getElementById('retinaBtn');
     const interpBtn = document.getElementById('interpBtn');
+    const roundBtn = document.getElementById('roundBtn');
     const resetBtn = document.getElementById('resetBtn');
+    const threshBtn = document.getElementById('threshBtn');
+    const threshSlider = document.getElementById('threshSlider');
+    const threshLabel = document.getElementById('threshLabel');
+
+    // --- Threshold state ---
+    let threshOn = settings.threshOn;
+    let threshSliderVal = settings.threshSlider;
+    threshSlider.value = threshSliderVal;
+    threshSlider.disabled = !threshOn;
+
+    function updateThresholdUI() {
+        threshSlider.disabled = !threshOn;
+        threshBtn.textContent = `[H] Thresh: ${threshOn ? 'ON' : 'OFF'}`;
+        threshBtn.classList.toggle('on', threshOn);
+        // Slider [0,1000] → [0.0, 1.0] threshold value
+        threshLabel.textContent = threshOn ? (threshSliderVal / 1000).toFixed(2) : '';
+    }
+
+    function applyThreshold() {
+        if (renderer) {
+            renderer.thresholdOn = threshOn ? 1 : 0;
+            renderer.thresholdValue = threshSliderVal / 1000;
+        }
+        updateThresholdUI();
+    }
 
     // --- Sync UI to loaded settings ---
     function syncUI() {
-        resBtn.textContent = W;
-        blueNoiseBtn.textContent = `Blue Noise: ${blueNoiseOn ? 'ON' : 'OFF'}`;
+        resBtn.textContent = `[P] ${W}`;
+        blueNoiseBtn.textContent = `[B] Blue: ${blueNoiseOn ? 'ON' : 'OFF'}`;
         blueNoiseBtn.classList.toggle('on', blueNoiseOn);
-        bnItersBtn.textContent = `BN\u00d7${bnIters}`;
-        greyBtn.textContent = `Grey: ${greyscaleOn ? 'ON' : 'OFF'}`;
+        bnItersBtn.textContent = `[N] BN\u00d7${bnIters}`;
+        greyBtn.textContent = `[G] Grey: ${greyscaleOn ? 'ON' : 'OFF'}`;
         greyBtn.classList.toggle('on', greyscaleOn);
-        uniformBtn.textContent = `Uniform: ${uniformDisplayOn ? 'ON' : 'OFF'}`;
+        uniformBtn.textContent = `[U] Uniform: ${uniformDisplayOn ? 'ON' : 'OFF'}`;
         uniformBtn.classList.toggle('on', uniformDisplayOn);
-        retinaBtn.textContent = `Retina: ${retinaOn ? 'ON' : 'OFF'}`;
+        retinaBtn.textContent = `[T] Retina: ${retinaOn ? 'ON' : 'OFF'}`;
         retinaBtn.classList.toggle('on', retinaOn);
-        interpBtn.textContent = `Interp: ${bilinearOn ? 'Bilinear' : 'Nearest'}`;
+        interpBtn.textContent = `[I] Interp: ${bilinearOn ? 'Bilinear' : 'Nearest'}`;
         interpBtn.classList.toggle('on', !bilinearOn);
+        roundBtn.textContent = `[O] Round: ${ROUND_MODES[roundMode]}`;
+        roundBtn.classList.toggle('on', roundMode > 0);
+        threshSlider.value = threshSliderVal;
+        updateThresholdUI();
     }
 
     function persistSettings() {
@@ -206,6 +244,7 @@ async function main() {
             resIdx, blueNoise: blueNoiseOn, bnItersIdx,
             greyscale: greyscaleOn, uniformDisplay: uniformDisplayOn,
             retina: retinaOn, bilinear: bilinearOn,
+            roundMode, threshOn, threshSlider: threshSliderVal,
         });
     }
 
@@ -231,6 +270,7 @@ async function main() {
         renderer.blueNoiseIterations = bnIters;
         renderer.greyscaleEnabled = greyscaleOn;
         renderer.uniformDisplayEnabled = uniformDisplayOn;
+        renderer.roundMode = roundMode;
         await renderer.init();
     }
 
@@ -241,6 +281,7 @@ async function main() {
 
     try {
         await createRenderer();
+        applyThreshold();
     } catch (e) {
         errorEl.textContent = e.message;
         throw e;
@@ -254,7 +295,7 @@ async function main() {
         resIdx = (resIdx + 1) % RESOLUTIONS.length;
         W = RESOLUTIONS[resIdx];
         H = W;
-        resBtn.textContent = W;
+        resBtn.textContent = `[P] ${W}`;
         updateCanvasSize();
         persistSettings();
         createRenderer();
@@ -264,7 +305,7 @@ async function main() {
     function toggleBlueNoise() {
         blueNoiseOn = !blueNoiseOn;
         renderer.blueNoiseEnabled = blueNoiseOn;
-        blueNoiseBtn.textContent = `Blue Noise: ${blueNoiseOn ? 'ON' : 'OFF'}`;
+        blueNoiseBtn.textContent = `[B] Blue: ${blueNoiseOn ? 'ON' : 'OFF'}`;
         blueNoiseBtn.classList.toggle('on', blueNoiseOn);
         persistSettings();
     }
@@ -274,7 +315,7 @@ async function main() {
         bnItersIdx = (bnItersIdx + 1) % BN_ITERS_OPTIONS.length;
         bnIters = BN_ITERS_OPTIONS[bnItersIdx];
         renderer.blueNoiseIterations = bnIters;
-        bnItersBtn.textContent = `BN\u00d7${bnIters}`;
+        bnItersBtn.textContent = `[N] BN\u00d7${bnIters}`;
         persistSettings();
     }
     bnItersBtn.addEventListener('click', cycleBnIters);
@@ -282,7 +323,7 @@ async function main() {
     function toggleGreyscale() {
         greyscaleOn = !greyscaleOn;
         renderer.greyscaleEnabled = greyscaleOn;
-        greyBtn.textContent = `Grey: ${greyscaleOn ? 'ON' : 'OFF'}`;
+        greyBtn.textContent = `[G] Grey: ${greyscaleOn ? 'ON' : 'OFF'}`;
         greyBtn.classList.toggle('on', greyscaleOn);
         persistSettings();
     }
@@ -291,7 +332,7 @@ async function main() {
     function toggleUniformDisplay() {
         uniformDisplayOn = !uniformDisplayOn;
         renderer.uniformDisplayEnabled = uniformDisplayOn;
-        uniformBtn.textContent = `Uniform: ${uniformDisplayOn ? 'ON' : 'OFF'}`;
+        uniformBtn.textContent = `[U] Uniform: ${uniformDisplayOn ? 'ON' : 'OFF'}`;
         uniformBtn.classList.toggle('on', uniformDisplayOn);
         persistSettings();
     }
@@ -299,7 +340,7 @@ async function main() {
 
     function toggleRetina() {
         retinaOn = !retinaOn;
-        retinaBtn.textContent = `Retina: ${retinaOn ? 'ON' : 'OFF'}`;
+        retinaBtn.textContent = `[T] Retina: ${retinaOn ? 'ON' : 'OFF'}`;
         retinaBtn.classList.toggle('on', retinaOn);
         updateCanvasSize();
         persistSettings();
@@ -308,12 +349,34 @@ async function main() {
 
     function toggleInterp() {
         bilinearOn = !bilinearOn;
-        interpBtn.textContent = `Interp: ${bilinearOn ? 'Bilinear' : 'Nearest'}`;
+        interpBtn.textContent = `[I] Interp: ${bilinearOn ? 'Bilinear' : 'Nearest'}`;
         interpBtn.classList.toggle('on', !bilinearOn);
         updateInterpolation();
         persistSettings();
     }
     interpBtn.addEventListener('click', toggleInterp);
+
+    function cycleRoundMode() {
+        roundMode = (roundMode + 1) % ROUND_MODES.length;
+        renderer.roundMode = roundMode;
+        roundBtn.textContent = `[O] Round: ${ROUND_MODES[roundMode]}`;
+        roundBtn.classList.toggle('on', roundMode > 0);
+        persistSettings();
+    }
+    roundBtn.addEventListener('click', cycleRoundMode);
+
+    function toggleThreshold() {
+        threshOn = !threshOn;
+        applyThreshold();
+        persistSettings();
+    }
+    threshBtn.addEventListener('click', toggleThreshold);
+
+    threshSlider.addEventListener('input', () => {
+        threshSliderVal = parseInt(threshSlider.value);
+        applyThreshold();
+        persistSettings();
+    });
 
     function resetAll() {
         localStorage.removeItem(STORAGE_KEY);
@@ -325,10 +388,13 @@ async function main() {
         uniformDisplayOn = d.uniformDisplay;
         retinaOn = d.retina;
         bilinearOn = d.bilinear;
+        roundMode = d.roundMode;
+        threshOn = d.threshOn;
+        threshSliderVal = d.threshSlider;
         syncUI();
         updateCanvasSize();
         updateInterpolation();
-        createRenderer();
+        createRenderer().then(() => applyThreshold());
     }
     resetBtn.addEventListener('click', resetAll);
 
@@ -363,13 +429,18 @@ async function main() {
         if (e.code === 'Escape' && mouseCaptured) {
             document.exitPointerLock();
         }
-        if (e.code === 'KeyB') toggleBlueNoise();
-        if (e.code === 'KeyN') cycleBnIters();
-        if (e.code === 'KeyG') toggleGreyscale();
-        if (e.code === 'KeyU') toggleUniformDisplay();
-        if (e.code === 'KeyR' && !mouseCaptured) cycleResolution();
-        if (e.code === 'KeyT') toggleRetina();
-        if (e.code === 'KeyI') toggleInterp();
+        // Skip hotkeys when Cmd/Ctrl held — prevents Cmd+R (refresh) from cycling resolution, etc.
+        if (!e.metaKey && !e.ctrlKey) {
+            if (e.code === 'KeyB') toggleBlueNoise();
+            if (e.code === 'KeyN') cycleBnIters();
+            if (e.code === 'KeyG') toggleGreyscale();
+            if (e.code === 'KeyU') toggleUniformDisplay();
+            if (e.code === 'KeyP' && !mouseCaptured) cycleResolution();
+            if (e.code === 'KeyT') toggleRetina();
+            if (e.code === 'KeyI') toggleInterp();
+            if (e.code === 'KeyH') toggleThreshold();
+            if (e.code === 'KeyO') cycleRoundMode();
+        }
     });
     document.addEventListener('keyup', (e) => { camera.keys[e.code] = false; });
     canvas.addEventListener('click', () => {
