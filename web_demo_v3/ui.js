@@ -13,7 +13,7 @@ const SETTINGS_VERSION = 1;
 const DEFAULTS = {
     resIdx: 1,          // 1024 default for V3 (physics is heavier)
     blueNoise: false,
-    bnItersIdx: 2,
+    bnItersIdx: 0,
     greyscale: false,
     uniformDisplay: true,
     retina: true,
@@ -22,6 +22,7 @@ const DEFAULTS = {
     threshSlider: 500,
     roundMode: 0,
     noiseOpacity: 25,   // 0-100 → 0.0-1.0
+    shadows: true,
 };
 
 function loadSettings() {
@@ -64,9 +65,15 @@ export class UIManager {
         this.modeSettingsEl = document.getElementById('modeSettings');
         this.resetSceneBtn = document.getElementById('resetSceneBtn');
         this.slowMoBtn = document.getElementById('slowMoBtn');
+        this.timeMiddayBtn = document.getElementById('timeMidday');
+        this.timeSunsetBtn = document.getElementById('timeSunset');
+        this.timeNightBtn = document.getElementById('timeNight');
+        this.timeDawnBtn = document.getElementById('timeDawn');
         this.modeBar = document.getElementById('modeBar');
         this.modeBtns = this.modeBar ? [...this.modeBar.querySelectorAll('.modeBtn')] : [];
         this.statsEl = document.getElementById('stats');
+
+        this.shadowsBtn = document.getElementById('shadowsBtn');
 
         this.slowMo = false;
         this.noiseLocked = false;
@@ -104,6 +111,8 @@ export class UIManager {
         this.slowMoBtn.classList.toggle('on', this.slowMo);
         this.lockNoiseBtn.textContent = `[L] Lock: ${this.noiseLocked ? 'ON' : 'OFF'}`;
         this.lockNoiseBtn.classList.toggle('on', this.noiseLocked);
+        this.shadowsBtn.textContent = `[V] Shadows: ${s.shadows ? 'ON' : 'OFF'}`;
+        this.shadowsBtn.classList.toggle('on', s.shadows);
         // Noise opacity slider (visible only in S+N mode)
         this.modeSettingsEl.style.display = (this.displayMode === 2) ? 'inline' : 'none';
         this.noiseOpacitySlider.value = s.noiseOpacity;
@@ -129,6 +138,7 @@ export class UIManager {
         renderer.thresholdValue = s.threshSlider / 1000;
         renderer.noiseOpacity = s.noiseOpacity / 100;
         renderer.noiseLocked = this.noiseLocked;
+        renderer.shadowsEnabled = s.shadows;
     }
 
     /**
@@ -188,6 +198,7 @@ export class UIManager {
         this.noiseOpacitySlider.addEventListener('input', () => {
             s.noiseOpacity = parseInt(this.noiseOpacitySlider.value); update();
         });
+        this.shadowsBtn.addEventListener('click', () => { s.shadows = !s.shadows; update(); });
         // Mode bar buttons
         for (const btn of this.modeBtns) {
             btn.addEventListener('click', () => {
@@ -195,6 +206,13 @@ export class UIManager {
                 this.syncUI();
             });
         }
+
+        // Time-of-day presets (elapsedSecs that place the sun at the desired angle)
+        const TIME_PRESETS = { midday: 0, sunset: 75, night: 150, dawn: 225 };
+        this.timeMiddayBtn.addEventListener('click', () => { this.callbacks.onSetTime?.(TIME_PRESETS.midday); });
+        this.timeSunsetBtn.addEventListener('click', () => { this.callbacks.onSetTime?.(TIME_PRESETS.sunset); });
+        this.timeNightBtn.addEventListener('click',  () => { this.callbacks.onSetTime?.(TIME_PRESETS.night); });
+        this.timeDawnBtn.addEventListener('click',   () => { this.callbacks.onSetTime?.(TIME_PRESETS.dawn); });
 
         this.resetBtn.addEventListener('click', () => {
             localStorage.removeItem(STORAGE_KEY);
@@ -224,6 +242,7 @@ export class UIManager {
             if (e.code === 'KeyR') this.resetSceneBtn.click();
             if (e.code === 'KeyL') this.lockNoiseBtn.click();
             if (e.code === 'KeyM') this.slowMoBtn.click();
+            if (e.code === 'KeyV') this.shadowsBtn.click();
         });
     }
 

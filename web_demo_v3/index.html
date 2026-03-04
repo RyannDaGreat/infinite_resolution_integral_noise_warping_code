@@ -77,8 +77,14 @@
         </span>
         <span class="sep">|</span>
         <button id="lockNoiseBtn" title="Freeze noise in place — no warp updates">[L] Lock: OFF</button>
+        <button id="shadowsBtn" title="Toggle shadow mapping [V]">[V] Shadows: ON</button>
         <button id="resetSceneBtn" title="Reset physics scene — re-stand all dominoes">[R] Reset</button>
         <button id="slowMoBtn" title="Toggle slow-motion physics">[M] Slow: OFF</button>
+        <span class="sep">|</span>
+        <button id="timeMidday" title="Set time: Midday"><iconify-icon icon="mdi:weather-sunny" width="14"></iconify-icon></button>
+        <button id="timeSunset" title="Set time: Sunset"><iconify-icon icon="mdi:weather-sunset" width="14"></iconify-icon></button>
+        <button id="timeNight" title="Set time: Night"><iconify-icon icon="mdi:weather-night" width="14"></iconify-icon></button>
+        <button id="timeDawn" title="Set time: Dawn"><iconify-icon icon="mdi:weather-sunset-up" width="14"></iconify-icon></button>
         <button id="resetBtn" title="Reset all settings to defaults">Defaults</button>
         <span id="modeSettings" style="display:none;">
             <span class="sep">|</span>
@@ -103,6 +109,7 @@
     <div id="error"></div>
 
     <script src="https://cdn.jsdelivr.net/npm/gl-matrix@3.4.3/gl-matrix-min.js"></script>
+    <script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
     <script type="module" src="main.js"></script>
 </body>
 </html>

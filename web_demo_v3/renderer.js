@@ -3,13 +3,13 @@
  * Zero CPU-GPU copies per frame for the warp — only the instance buffer is uploaded.
  */
 
-import { boxVertices, beveledBoxVertices, sphereVertices, quadVertices } from './geometry.js';
+import { boxVertices, beveledBoxVertices, sphereVertices, quadVertices, terrainMeshVertices } from './geometry.js';
 import {
-    sceneWGSL, displayWGSL,
+    sceneWGSL, skyWGSL, shadowWGSL, displayWGSL,
     buildDeformWGSL, backwardMapWGSL, brownianWGSL, normalizeWGSL,
     blueNoiseBlurWGSL,
 } from './shaders.js';
-import { MAX_INSTANCES, FLOATS_PER_INSTANCE } from './scene.js';
+import { MAX_INSTANCES, FLOATS_PER_INSTANCE, TERRAIN_INSTANCE_IDX } from './scene.js';
 
 const NUM_TIMESTAMPS = 12;
 
@@ -47,6 +47,98 @@ function makeRandn(seed) {
 }
 
 // ---------------------------------------------------------------------------
+// Shadow map helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure function. Build an orthographic light-space matrix for a directional
+ * shadow map. Looks from sunDir toward origin, covering a square world-space
+ * area of ±halfExtent units and a depth range of depthRange units.
+ *
+ * Returns a column-major Float32Array(16) in WebGPU NDC convention (depth 0→1).
+ *
+ * Args:
+ *   sunDir (number[4]): normalized sun direction [x, y, z, 0]
+ *   halfExtent (number): ortho half-width and half-height in world units
+ *   depthRange (number): total depth extent of the ortho frustum
+ *
+ * Returns:
+ *   Float32Array(16)
+ *
+ * Examples:
+ *   >>> buildLightSpaceMatrix([0,1,0,0], 100, 300).length
+ *   16
+ */
+function buildLightSpaceMatrix(sunDir, halfExtent, depthRange) {
+    const [lx, ly, lz] = sunDir;
+
+    // Build an orthonormal frame with Z pointing along -sunDir (into the scene).
+    // Light "looks" from the sun toward origin along -lightZ.
+    const lightZ = [-lx, -ly, -lz];
+
+    // Choose a stable world-up reference; fall back to world-forward when sun is near zenith.
+    const upRef  = Math.abs(ly) > 0.99 ? [0, 0, 1] : [0, 1, 0];
+    const lightX = normalize3(cross3(upRef, lightZ));
+    const lightY = cross3(lightZ, lightX);
+
+    // View matrix: world → light space (lookAt from sun position toward origin)
+    // We don't need an actual translation since the ortho covers the entire area.
+    // The camera sits "depthRange/2" units above the scene along -lightZ.
+    const camPos = [lx * depthRange * 0.5, ly * depthRange * 0.5, lz * depthRange * 0.5];
+    const tx = -(dot3(lightX, camPos));
+    const ty = -(dot3(lightY, camPos));
+    const tz = -(dot3(lightZ, camPos));
+
+    // Column-major 4×4 view matrix (rows of the rotation become columns)
+    const view = new Float32Array([
+        lightX[0], lightY[0], lightZ[0], 0,
+        lightX[1], lightY[1], lightZ[1], 0,
+        lightX[2], lightY[2], lightZ[2], 0,
+        tx,        ty,        tz,        1,
+    ]);
+
+    // Orthographic projection: maps ±halfExtent → ±1 in X/Y, 0..depthRange → 0..1 in Z.
+    // WebGPU uses depth [0,1], so near maps to 0, far to 1.
+    const r = halfExtent;
+    const proj = new Float32Array([
+        1/r,   0,    0,    0,
+        0,     1/r,  0,    0,
+        0,     0,    1/depthRange, 0,
+        0,     0,    0,    1,
+    ]);
+
+    return mat4mul(proj, view);
+}
+
+function normalize3(v) {
+    const len = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    return [v[0]/len, v[1]/len, v[2]/len];
+}
+
+function cross3(a, b) {
+    return [
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0],
+    ];
+}
+
+function dot3(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+
+/** Pure function. Column-major 4×4 matrix multiply: returns A*B. */
+function mat4mul(a, b) {
+    const m = new Float32Array(16);
+    for (let col = 0; col < 4; col++) {
+        for (let row = 0; row < 4; row++) {
+            let s = 0;
+            for (let k = 0; k < 4; k++) s += a[k*4+row] * b[col*4+k];
+            m[col*4+row] = s;
+        }
+    }
+    return m;
+}
+
+// ---------------------------------------------------------------------------
 // WebGPU Renderer
 // ---------------------------------------------------------------------------
 
@@ -68,13 +160,15 @@ export class WebGPURenderer {
         this.noiseStats = { mean: 0, std: 1 };
 
         this.blueNoiseEnabled = false;
-        this.blueNoiseIterations = 10;
+        this.blueNoiseIterations = 2;
         this.blueNoiseCutoffDivider = 8.0;
 
         this.greyscaleEnabled = false;
         this.uniformDisplayEnabled = false;
         this.noiseOpacity = 0.25;
         this.noiseLocked = false;
+        this._wasLocked = false;
+        this.shadowsEnabled = true;
     }
 
     async init() {
@@ -109,17 +203,18 @@ export class WebGPURenderer {
         this.colorTex?.destroy();
         this.motionTex?.destroy();
         this.depthTex?.destroy();
+        this.shadowTex?.destroy();
 
         const bufs = [
             this.noiseBuf, this.bufferBuf, this.totalRequestBuf, this.ticketCountBuf,
             this.masterFieldBuf, this.areaFieldBuf, this.deformationBuf,
-            this.cameraUniformBuf, this.instanceBuf,
+            this.cameraUniformBuf, this.skyUniformBuf, this.shadowUniformBuf, this.lightUniformBuf, this.instanceBuf,
             this.computeUniformBuf, this.displayUniformBuf,
             this._statsStagingBuf,
             this.bnBackupBuf,
             this.bnBlurHUniformBuf,
             ...(this.bnBlurVUniformBufs || []),
-            this.boxVB, this.sphereVB, this.quadVB,
+            this.boxVB, this.sphereVB, this.quadVB, this.terrainVB,
         ];
         if (this.hasTimestamps) bufs.push(this.querySet, this.tsResolveBuf, this.tsReadBuf);
         for (const b of bufs) b?.destroy?.();
@@ -143,9 +238,15 @@ export class WebGPURenderer {
             size: [W, H], format: 'depth24plus',
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
+        // Shadow map: 4096×4096 depth texture, sampled in scene shader for PCF.
+        this.shadowTex = device.createTexture({
+            size: [4096, 4096], format: 'depth32float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
         this.colorTexView  = this.colorTex.createView();
         this.motionTexView = this.motionTex.createView();
         this.depthTexView  = this.depthTex.createView();
+        this.shadowTexView = this.shadowTex.createView({ aspect: 'depth-only' });
     }
 
     _createBuffers() {
@@ -165,9 +266,26 @@ export class WebGPURenderer {
         this.areaFieldBuf    = storage(N * MAX_TICKETS * f4);
         this.deformationBuf  = storage(N * 2 * f4);
 
-        // Camera uniform: viewProj (64) + prevViewProj (64) = 128 bytes
+        // Camera uniform: viewProj (64) + prevViewProj (64) + sunDir (16) + lightSpaceMatrix (64)
+        //                 + eyePos (16) + eyeDir (16) = 240 bytes
         this.cameraUniformBuf = device.createBuffer({
-            size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 240, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Shadow uniform: lightSpaceMatrix (64 bytes) for the shadow depth pass
+        this.shadowUniformBuf = device.createBuffer({
+            size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Sky uniform: invViewProj (64) + sunDir (16) + time vec4 (16) = 96 bytes
+        this.skyUniformBuf = device.createBuffer({
+            size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Point light buffer: count(u32) + 3 pad(u32) + 32 × PointLight(2 × vec4f = 32 bytes)
+        // Total: 16 + 32 × 32 = 1040 bytes
+        this.lightUniformBuf = device.createBuffer({
+            size: 1040, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
         // Instance storage buffer: MAX_INSTANCES × 144 bytes
@@ -206,12 +324,35 @@ export class WebGPURenderer {
     _createPipelines() {
         const { device } = this;
         const mod = (code) => device.createShaderModule({ code });
+        const skyModule       = mod(skyWGSL);
         const sceneModule     = mod(sceneWGSL);
+        const shadowModule    = mod(shadowWGSL);
         const displayModule   = mod(displayWGSL);
         const buildDeformMod  = mod(buildDeformWGSL);
         const backwardMapMod  = mod(backwardMapWGSL);
         const brownianMod     = mod(brownianWGSL);
         const normalizeMod    = mod(normalizeWGSL);
+
+        // Shadow pipeline: depth-only, no fragment shader, same vertex layout as scene.
+        this.shadowPipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: shadowModule, entryPoint: 'vs',
+                buffers: [{
+                    arrayStride: 6 * 4,
+                    attributes: [
+                        { shaderLocation: 0, offset: 0,  format: 'float32x3' },
+                        { shaderLocation: 1, offset: 12, format: 'float32x3' },
+                    ],
+                }],
+            },
+            depthStencil: {
+                format: 'depth32float',
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+            },
+            primitive: { topology: 'triangle-list', cullMode: 'back' },
+        });
 
         // Scene pipeline: instanced, 6 floats per vertex (position + normal)
         this.scenePipeline = device.createRenderPipeline({
@@ -239,6 +380,34 @@ export class WebGPURenderer {
                 depthCompare: 'less',
             },
             primitive: { topology: 'triangle-list', cullMode: 'back' },
+        });
+
+        // Sky pipeline: fullscreen quad, writes to same MRT as scene, depth = 1.0
+        this.skyPipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: skyModule, entryPoint: 'vs',
+                buffers: [{
+                    arrayStride: 4 * 4,
+                    attributes: [
+                        { shaderLocation: 0, offset: 0, format: 'float32x2' },
+                        { shaderLocation: 1, offset: 8, format: 'float32x2' },
+                    ],
+                }],
+            },
+            fragment: {
+                module: skyModule, entryPoint: 'fs',
+                targets: [
+                    { format: 'rgba8unorm' },
+                    { format: 'rgba32float' },
+                ],
+            },
+            depthStencil: {
+                format: 'depth24plus',
+                depthWriteEnabled: false,
+                depthCompare: 'always',  // always pass; depth already cleared to 1.0
+            },
+            primitive: { topology: 'triangle-list' },
         });
 
         // Display pipeline (same as V2)
@@ -279,12 +448,39 @@ export class WebGPURenderer {
         const { device } = this;
         const buf = (b) => ({ buffer: b });
 
-        // Scene bind group: camera uniform + instance storage
+        // Sky bind group: sky uniforms
+        this.skyBindGroup = device.createBindGroup({
+            layout: this.skyPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.skyUniformBuf) },
+            ],
+        });
+
+        // Shadow comparison sampler — used by scene shader for PCF
+        this.shadowSampler = device.createSampler({
+            compare: 'less',
+            magFilter: 'linear',
+            minFilter: 'linear',
+        });
+
+        // Shadow pass bind group: light-space uniform + instance storage
+        this.shadowPassBindGroup = device.createBindGroup({
+            layout: this.shadowPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.shadowUniformBuf) },
+                { binding: 1, resource: buf(this.instanceBuf) },
+            ],
+        });
+
+        // Scene bind group: camera uniform + instance storage + shadow map + shadow sampler + lights
         this.sceneBindGroup = device.createBindGroup({
             layout: this.scenePipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: buf(this.cameraUniformBuf) },
                 { binding: 1, resource: buf(this.instanceBuf) },
+                { binding: 2, resource: this.shadowTexView },
+                { binding: 3, resource: this.shadowSampler },
+                { binding: 4, resource: buf(this.lightUniformBuf) },
             ],
         });
 
@@ -381,9 +577,10 @@ export class WebGPURenderer {
         };
 
         const boxData = boxVertices();
-        const bevelData = beveledBoxVertices(0.04, [0.75, 1.5, 0.18]);
+        const bevelData = beveledBoxVertices(0.75, 1.5, 0.18, 0.04, 2);
         const sphereData = sphereVertices();
         const quadData = quadVertices();
+        const terrainData = terrainMeshVertices(2400, 4500);
 
         this.boxVB = uploadVB(boxData);
         this.boxVertCount = boxData.length / 6;
@@ -393,6 +590,37 @@ export class WebGPURenderer {
         this.sphereVertCount = sphereData.length / 6;
         this.quadVB = uploadVB(quadData);
         this.quadVertCount = quadData.length / 4;
+        this.terrainVB = uploadVB(terrainData);
+        this.terrainVertCount = terrainData.length / 6;
+
+        // Write static terrain instance: identity model matrix, sentinel color
+        this._writeTerrainInstance();
+    }
+
+    /**
+     * Write the terrain instance data (identity model, sentinel color) into the
+     * instance buffer at TERRAIN_INSTANCE_IDX. Called once after buffer creation.
+     * Not pure: writes to GPU buffer.
+     */
+    _writeTerrainInstance() {
+        // Identity mat4 (column-major)
+        const identity = new Float32Array([
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1,
+        ]);
+        // Sentinel terrain color: R=0.12, G=0.48, B=0.08, A=1.0
+        // (distinct from all other materials, detected in the fragment shader)
+        const terrainColor = new Float32Array([0.12, 0.48, 0.08, 1.0]);
+
+        const instanceData = new Float32Array(FLOATS_PER_INSTANCE);
+        instanceData.set(identity, 0);   // current model
+        instanceData.set(identity, 16);  // prev model (same — static)
+        instanceData.set(terrainColor, 32);
+
+        const byteOffset = TERRAIN_INSTANCE_IDX * FLOATS_PER_INSTANCE * 4;
+        this.device.queue.writeBuffer(this.instanceBuf, byteOffset, instanceData);
     }
 
     _initProfiler() {
@@ -472,22 +700,77 @@ export class WebGPURenderer {
      * @param {object} opts
      * @param {Float32Array} opts.viewProj - current viewProj matrix
      * @param {Float32Array} opts.prevViewProj - previous frame's viewProj
+     * @param {Float32Array} opts.invViewProj - inverse of current viewProj (for sky ray reconstruction)
      * @param {Float32Array} opts.instanceData - active instance data
-     * @param {number} opts.numBoxInstances - box instance count
+     * @param {number} opts.numBoxInstances - total box instance count (floor + dominoes + maze + chest)
      * @param {number} opts.numSphereInstances - sphere instance count
+     * @param {number} opts.numDominoInstances - domino-only count (for beveled VB draw call)
      * @param {number} opts.displayMode - 0-4
      * @param {number} opts.frameSeed - incrementing seed
+     * @param {number} opts.elapsedSecs - seconds since page load, drives day/night cycle
+     * @param {number[]} opts.eyePos - [x, y, z] camera world position (for flashlight)
+     * @param {number[]} opts.eyeDir - [x, y, z] camera forward unit vector (for flashlight)
      */
-    frame({ viewProj, prevViewProj, instanceData, numBoxInstances, numSphereInstances, displayMode, frameSeed }) {
+    frame({ viewProj, prevViewProj, invViewProj, instanceData, numBoxInstances, numSphereInstances, numDominoInstances, displayMode, frameSeed, elapsedSecs = 0, eyePos = [0,0,0], eyeDir = [0,0,-1], lights = [] }) {
         const { device, W, H, N } = this;
         const workgroups256 = Math.ceil(N / 256);
         const brownianWGs = Math.ceil(N / this.brownianWG);
 
-        // Upload camera uniforms
-        const camData = new Float32Array(32);
+        // Day/night cycle: one full cycle every 5 minutes (300 seconds).
+        // angle=0 → sun at horizon rising; angle=π/2 → solar noon; angle=π → setting; angle>π → night.
+        const DAY_CYCLE_SECS = 300;
+        // Start at solar noon (π/2 offset so sun is overhead at t=0)
+        const angle = (2 * Math.PI * elapsedSecs) / DAY_CYCLE_SECS + Math.PI / 2;
+        // sunDir: x=cos(angle) sweeps east→west, y=sin(angle) rises/sets, z=slight tilt north
+        const rawX = Math.cos(angle);
+        const rawY = Math.sin(angle);
+        const rawZ = 0.3;
+        const len = Math.sqrt(rawX * rawX + rawY * rawY + rawZ * rawZ);
+        const sunDir = [rawX / len, rawY / len, rawZ / len, 0.0];
+
+        // Orthographic light-space matrix for directional shadow map.
+        // Covers a 200×200 world-unit area centred at origin, depth range 0..300.
+        const lightSpaceMatrix = buildLightSpaceMatrix(sunDir, 200, 300);
+
+        // Upload camera uniforms: viewProj (64) + prevViewProj (64) + sunDir (16) + lightSpaceMatrix (64)
+        //                         + eyePos (16) + eyeDir (16) = 240 bytes  (60 floats)
+        const camData = new Float32Array(60);
         camData.set(viewProj, 0);
         camData.set(prevViewProj, 16);
+        camData.set(sunDir, 32);
+        camData.set(lightSpaceMatrix, 36);
+        camData.set([eyePos[0], eyePos[1], eyePos[2], 0.0], 52);  // eyePos (vec4f at float index 52)
+        camData.set([eyeDir[0], eyeDir[1], eyeDir[2], 0.0], 56);  // eyeDir (vec4f at float index 56)
         device.queue.writeBuffer(this.cameraUniformBuf, 0, camData);
+
+        // Shadow uniform: lightSpaceMatrix only (used in depth-only shadow pass)
+        device.queue.writeBuffer(this.shadowUniformBuf, 0, lightSpaceMatrix);
+
+        // Upload sky uniforms: invViewProj (64) + sunDir (16) + time vec4 (16)
+        const skyData = new Float32Array(24);
+        skyData.set(invViewProj, 0);
+        skyData.set(sunDir, 16);
+        skyData[20] = elapsedSecs;  // time.x = elapsed seconds for cloud animation
+        // skyData[21..23] = padding zeros
+        device.queue.writeBuffer(this.skyUniformBuf, 0, skyData);
+
+        // Upload point lights: count(u32) + 3 pad(u32) + 32 × (posAndRadius vec4f + color vec4f)
+        const lightData = new Float32Array(4 + 32 * 8);  // 260 floats = 1040 bytes
+        const lightU32 = new Uint32Array(lightData.buffer);
+        const numLights = Math.min(lights.length, 32);
+        lightU32[0] = numLights;
+        for (let i = 0; i < numLights; i++) {
+            const base = 4 + i * 8;
+            lightData[base]     = lights[i].pos[0];
+            lightData[base + 1] = lights[i].pos[1];
+            lightData[base + 2] = lights[i].pos[2];
+            lightData[base + 3] = lights[i].radius;
+            lightData[base + 4] = lights[i].color[0];
+            lightData[base + 5] = lights[i].color[1];
+            lightData[base + 6] = lights[i].color[2];
+            lightData[base + 7] = lights[i].intensity;
+        }
+        device.queue.writeBuffer(this.lightUniformBuf, 0, lightData);
 
         // Upload instance data
         if (instanceData.length > 0) {
@@ -514,10 +797,67 @@ export class WebGPURenderer {
 
         const encoder = device.createCommandEncoder();
 
-        // --- Scene render (instanced MRT) ---
+        // Instance layout helpers (shared by shadow pass and scene pass)
+        const numDominoes  = numDominoInstances || 0;
+        const mazeStartIdx = 1 + numDominoes;
+        const numMazeBoxes = numBoxInstances - mazeStartIdx;
+
+        // --- Shadow pass: render all geometry into the 2048×2048 depth map ---
+        // Only run when shadows are enabled AND sun is above horizon (night has no shadow).
+        if (this.shadowsEnabled && sunDir[1] > 0.0) {
+            const shadowPass = encoder.beginRenderPass({
+                colorAttachments: [],
+                depthStencilAttachment: {
+                    view: this.shadowTexView,
+                    depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
+                },
+            });
+            shadowPass.setPipeline(this.shadowPipeline);
+            shadowPass.setBindGroup(0, this.shadowPassBindGroup);
+
+            // Floor
+            shadowPass.setVertexBuffer(0, this.boxVB);
+            shadowPass.draw(this.boxVertCount, 1, 0, 0);
+
+            // Dominoes
+            if (numDominoes > 0) {
+                shadowPass.setVertexBuffer(0, this.bevelBoxVB);
+                shadowPass.draw(this.bevelBoxVertCount, numDominoes, 0, 1);
+            }
+
+            // Remaining boxes
+            if (numMazeBoxes > 0) {
+                shadowPass.setVertexBuffer(0, this.boxVB);
+                shadowPass.draw(this.boxVertCount, numMazeBoxes, 0, mazeStartIdx);
+            }
+
+            // Spheres
+            if (numSphereInstances > 0) {
+                shadowPass.setVertexBuffer(0, this.sphereVB);
+                shadowPass.draw(this.sphereVertCount, numSphereInstances, 0, numBoxInstances);
+            }
+
+            // Terrain
+            shadowPass.setVertexBuffer(0, this.terrainVB);
+            shadowPass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
+
+            shadowPass.end();
+        } else {
+            // Shadows disabled or sun below horizon: clear shadow map to 1.0 so PCF always passes.
+            const clearPass = encoder.beginRenderPass({
+                colorAttachments: [],
+                depthStencilAttachment: {
+                    view: this.shadowTexView,
+                    depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
+                },
+            });
+            clearPass.end();
+        }
+
+        // --- Scene render (sky + instanced MRT) ---
         const scenePass = encoder.beginRenderPass({
             colorAttachments: [
-                { view: this.colorTexView, loadOp: 'clear', storeOp: 'store', clearValue: [0.05, 0.05, 0.08, 1] },
+                { view: this.colorTexView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] },
                 { view: this.motionTexView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] },
             ],
             depthStencilAttachment: {
@@ -528,6 +868,14 @@ export class WebGPURenderer {
                 timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
             } : {}),
         });
+
+        // Sky background: fullscreen quad at far plane
+        scenePass.setPipeline(this.skyPipeline);
+        scenePass.setBindGroup(0, this.skyBindGroup);
+        scenePass.setVertexBuffer(0, this.quadVB);
+        scenePass.draw(this.quadVertCount);
+
+        // Scene geometry on top (depth < 1.0 wins)
         scenePass.setPipeline(this.scenePipeline);
         scenePass.setBindGroup(0, this.sceneBindGroup);
 
@@ -535,10 +883,16 @@ export class WebGPURenderer {
         scenePass.setVertexBuffer(0, this.boxVB);
         scenePass.draw(this.boxVertCount, 1, 0, 0);
 
-        // Draw dominoes (beveled box): instances 1..numBoxInstances-1
-        if (numBoxInstances > 1) {
+        // Draw dominoes (beveled box): instances 1..1+numDominoInstances
+        if (numDominoes > 0) {
             scenePass.setVertexBuffer(0, this.bevelBoxVB);
-            scenePass.draw(this.bevelBoxVertCount, numBoxInstances - 1, 0, 1);
+            scenePass.draw(this.bevelBoxVertCount, numDominoes, 0, 1);
+        }
+
+        // Draw remaining boxes (maze, tower, marble machine, etc.): instances after dominoes up to numBoxInstances
+        if (numMazeBoxes > 0) {
+            scenePass.setVertexBuffer(0, this.boxVB);
+            scenePass.draw(this.boxVertCount, numMazeBoxes, 0, mazeStartIdx);
         }
 
         // Draw spheres: instances numBoxInstances..numBoxInstances+numSphereInstances-1
@@ -547,9 +901,18 @@ export class WebGPURenderer {
             scenePass.draw(this.sphereVertCount, numSphereInstances, 0, numBoxInstances);
         }
 
+        // Draw terrain mesh: single non-instanced draw at TERRAIN_INSTANCE_IDX
+        scenePass.setVertexBuffer(0, this.terrainVB);
+        scenePass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
+
         scenePass.end();
 
-        // --- Warp pipeline (skipped when noise is locked) ---
+        // --- Warp pipeline ---
+        // Track lock transition: on the frame lock engages, bake blue noise
+        // into noiseBuf so the snapshot includes it.
+        const justLocked = this.noiseLocked && !this._wasLocked;
+        this._wasLocked = this.noiseLocked;
+
         if (!this.noiseLocked) {
 
         // --- Build deformation ---
@@ -607,7 +970,11 @@ export class WebGPURenderer {
             this._encodeBlueNoise(encoder, workgroups256);
         }
 
-        } // end noiseLocked check
+        } else if (justLocked && this.blueNoiseEnabled) {
+            // Lock just engaged with blue noise on: bake it into noiseBuf
+            // permanently (no restore) so the snapshot includes blue noise.
+            this._encodeBlueNoise(encoder, workgroups256);
+        }
 
         // --- Display ---
         const canvasView = this.ctx.getCurrentTexture().createView();
@@ -627,8 +994,8 @@ export class WebGPURenderer {
         dispPass.draw(this.quadVertCount);
         dispPass.end();
 
-        // Restore noise after blue noise display
-        if (this.blueNoiseEnabled) {
+        // Restore noise after blue noise display (skip when locked — noiseBuf is the snapshot)
+        if (!this.noiseLocked && this.blueNoiseEnabled) {
             encoder.copyBufferToBuffer(this.bnBackupBuf, 0, this.noiseBuf, 0, N * this.C * 4);
         }
 

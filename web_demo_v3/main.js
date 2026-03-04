@@ -51,6 +51,7 @@ async function main() {
         },
         onResetScene: () => { physics.reset(); scene.prevTransforms.clear(); },
         onSlowMo: (on) => { physics.slowMo = on; },
+        onSetTime: (targetElapsed) => { startTime = performance.now() - targetElapsed * 1000; },
     });
 
     async function createRenderer() {
@@ -73,7 +74,7 @@ async function main() {
 
     // --- Projection matrix ---
     let proj = mat4.create();
-    mat4.perspective(proj, glMatrix.toRadian(70), 1.0, 0.1, 200);
+    mat4.perspective(proj, glMatrix.toRadian(70), 1.0, 0.1, 100000);
 
     // --- Prev viewProj for motion vectors ---
     const eyePos = physics.getPlayerEyePos();
@@ -125,6 +126,7 @@ async function main() {
     let frameCounter = 0;
     let fpsAccum = 0;
     let displayFPS = 0;
+    let startTime = performance.now();
     let lastTime = performance.now();
     const cpuFrameHistory = [];
     let physicsMs = 0;
@@ -135,6 +137,7 @@ async function main() {
 
         const dt = Math.min((now - lastTime) / 1000, 0.1);
         lastTime = now;
+        const elapsedSecs = (now - startTime) / 1000;
 
         // Physics step
         const physStart = performance.now();
@@ -151,21 +154,49 @@ async function main() {
         const viewProj = mat4.create();
         mat4.mul(viewProj, proj, camera.viewMatrix(eyePos));
 
+        // Inverse viewProj for sky ray reconstruction
+        const invViewProj = mat4.create();
+        mat4.invert(invViewProj, viewProj);
+
         // Build instance buffer
         const sceneData = physics.getSceneData();
-        const { numBoxInstances, numSphereInstances } = scene.buildInstances(sceneData);
+        const { numBoxInstances, numSphereInstances, numDominoInstances } = scene.buildInstances(sceneData);
         const instanceData = scene.getActiveData();
+
+        // Collect point lights from glowing objects (spheres + mushroom caps)
+        const lights = [];
+        for (const s of sceneData.spheres) {
+            if (lights.length >= 32) break;
+            lights.push({ pos: [s.pos.x, s.pos.y, s.pos.z], color: [0.3, 0.5, 1.0], intensity: 3.0, radius: 15.0 });
+        }
+        if (sceneData.mushrooms) {
+            for (let i = 0; i < sceneData.mushrooms.length; i++) {
+                if (lights.length >= 32) break;
+                const m = sceneData.mushrooms[i];
+                // Only cap pieces glow (every other mushroom part is cap vs stem)
+                if (i % 2 === 1) {
+                    lights.push({ pos: [m.pos.x, m.pos.y, m.pos.z], color: [0.2, 0.8, 0.4], intensity: 2.0, radius: 10.0 });
+                }
+            }
+        }
 
         // Render
         const cpuStart = performance.now();
+        const fwd = camera.forward();
         renderer.frame({
             viewProj,
             prevViewProj,
+            invViewProj,
             instanceData,
             numBoxInstances,
             numSphereInstances,
+            numDominoInstances,
             displayMode: ui.displayMode,
             frameSeed,
+            elapsedSecs,
+            eyePos: [eyePos.x, eyePos.y, eyePos.z],
+            eyeDir: [fwd[0], fwd[1], fwd[2]],
+            lights,
         });
         const cpuMs = performance.now() - cpuStart;
         cpuFrameHistory.push(cpuMs);
