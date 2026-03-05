@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fluid Noise Warp — Infinite Resolution Integral Noise</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #111; color: #ccc; font-family: 'Menlo', 'Consolas', monospace;
+    display: flex; flex-direction: column; align-items: center; min-height: 100vh;
+    overflow-x: hidden;
+}
+#toolbar {
+    display: flex; flex-wrap: wrap; gap: 4px; padding: 6px;
+    background: #1a1a1a; width: 100%; justify-content: center;
+    border-bottom: 1px solid #333; font-size: 11px;
+}
+#toolbar button, #toolbar select {
+    background: #222; color: #aaa; border: 1px solid #444;
+    padding: 3px 8px; cursor: pointer; font-family: inherit; font-size: 11px;
+    border-radius: 2px;
+}
+#toolbar button:hover { background: #333; }
+#toolbar button.on { color: #4f4; border-color: #4f4; }
+#toolbar .sep { width: 1px; background: #333; margin: 0 2px; }
+#toolbar label { color: #888; font-size: 10px; display: flex; align-items: center; gap: 3px; }
+#toolbar input[type="range"] { width: 60px; }
+
+#modeBar {
+    display: flex; gap: 2px; padding: 4px 6px;
+    background: #1a1a1a; width: 100%; justify-content: center;
+    border-bottom: 1px solid #333;
+}
+.modeBtn {
+    background: #222; color: #888; border: 1px solid #444;
+    padding: 3px 10px; cursor: pointer; font-family: inherit; font-size: 11px;
+    border-radius: 2px;
+}
+.modeBtn:hover { background: #333; }
+.modeBtn.on { color: #fff; background: #335; border-color: #66a; }
+
+#canvasWrap {
+    position: relative; display: flex; justify-content: center;
+    align-items: center; flex: 1; padding: 8px;
+}
+canvas {
+    image-rendering: pixelated;
+    border: 1px solid #333;
+    width: 100%;
+    max-width: 90vh;
+    aspect-ratio: 1;
+}
+#stats {
+    position: fixed; bottom: 4px; left: 4px;
+    font-size: 10px; color: #8f8; white-space: pre;
+    pointer-events: none; z-index: 10;
+    background: rgba(0,0,0,0.6); padding: 2px 6px;
+}
+#modeSettings {
+    display: none;
+}
+</style>
+</head>
+<body>
+
+<div id="modeBar">
+    <button class="modeBtn on" data-mode="0">1 noise</button>
+    <button class="modeBtn" data-mode="1">2 scene</button>
+    <button class="modeBtn" data-mode="2">3 S+N</button>
+    <button class="modeBtn" data-mode="3">4 dither</button>
+    <button class="modeBtn" data-mode="4">5 motion</button>
+    <button class="modeBtn" data-mode="5">6 raw</button>
+</div>
+
+<div id="toolbar">
+    <button id="resBtn">[P] 512</button>
+    <button id="greyBtn">[G] Grey: ON</button>
+    <button id="uniformBtn">[U] Uniform: ON</button>
+    <button id="retinaBtn">[T] Retina: OFF</button>
+    <button id="interpBtn">[I] Interp: Nearest</button>
+    <button id="roundBtn">[O] Round: >1</button>
+    <button id="blueNoiseBtn">[B] Blue: OFF</button>
+    <button id="bnItersBtn">[N] BN×2</button>
+    <button id="threshBtn">[H] Thresh: OFF</button>
+    <input type="range" id="threshSlider" min="0" max="1000" value="500">
+    <span id="threshLabel"></span>
+    <div class="sep"></div>
+    <button id="lockNoiseBtn">[L] Lock: OFF</button>
+    <span id="modeSettings">
+        <label>Opacity <input type="range" id="noiseOpacitySlider" min="0" max="100" value="25">
+        <span id="noiseOpacityLabel">0.25</span></label>
+    </span>
+    <div class="sep"></div>
+    <button id="pauseBtn">[Space] Pause: OFF</button>
+    <button id="splatBtn">Splat</button>
+    <div class="sep"></div>
+    <label>Sim
+        <select id="simResSelect">
+            <option value="32">32</option>
+            <option value="64">64</option>
+            <option value="128" selected>128</option>
+            <option value="256">256</option>
+        </select>
+    </label>
+    <label>Dye
+        <select id="dyeResSelect">
+            <option value="128">128</option>
+            <option value="256">256</option>
+            <option value="512">512</option>
+            <option value="1024" selected>1024</option>
+        </select>
+    </label>
+    <label>Curl <input type="range" id="curlSlider" min="0" max="50" value="30"><span id="curlLabel">30</span></label>
+    <label>Dissip <input type="range" id="dissipSlider" min="0" max="400" value="100"><span id="dissipLabel">1.00</span></label>
+    <label>Pressure <input type="range" id="pressureSlider" min="0" max="100" value="80"><span id="pressureLabel">0.80</span></label>
+    <div class="sep"></div>
+    <button id="resetBtn">Reset</button>
+</div>
+
+<div id="canvasWrap">
+    <canvas id="canvas"></canvas>
+</div>
+
+<pre id="stats"></pre>
+
+<div style="text-align:center; padding:8px; font-size:10px; color:#666;">
+    Fluid simulation based on <a href="https://github.com/PavelDoGreat/WebGL-Fluid-Simulation" style="color:#88a;" target="_blank">WebGL Fluid Simulation</a> by <a href="https://paveldogreat.github.io/WebGL-Fluid-Simulation/" style="color:#88a;" target="_blank">Pavel Dobryakov</a> (MIT License)
+    | Noise warp: <a href="https://arxiv.org/abs/2405.17942" style="color:#88a;" target="_blank">Infinite Resolution Integral Noise Warping</a> (ICLR 2025)
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
