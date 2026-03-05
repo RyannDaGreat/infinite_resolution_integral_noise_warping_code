@@ -1256,14 +1256,22 @@ fn luminance(c: vec3f) -> f32 {
         }
         return vec4f(clamp(scene + noiseContrib, vec3f(0.0), vec3f(1.0)), 1.0);
     }
-    // Mode 3: Dither (threshold scene luminance with noise)
+    // Mode 3: Dither (threshold with noise)
     if (disp.mode == 3u) {
         let scene = textureLoad(colorTex, vec2u(col, row), 0).rgb;
-        let lum = luminance(scene);
         let n = readNoise(col, row);
-        // Use noise as threshold: uniform CDF gives [0,1]
         let threshold = normal_cdf(n.x);
-        return select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(1.0, 1.0, 1.0, 1.0), lum > threshold);
+        if ((disp.flags & 1u) != 0u) {
+            // Greyscale: threshold luminance → black/white
+            let lum = luminance(scene);
+            return select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(1.0, 1.0, 1.0, 1.0), lum > threshold);
+        } else {
+            // Color: threshold each RGB channel independently
+            let r = select(0.0, 1.0, scene.r > threshold);
+            let g = select(0.0, 1.0, scene.g > threshold);
+            let b = select(0.0, 1.0, scene.b > threshold);
+            return vec4f(r, g, b, 1.0);
+        }
     }
     // Mode 4: Motion vectors
     if (disp.mode == 4u) {
