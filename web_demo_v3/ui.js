@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw'];
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 2;
+const SETTINGS_VERSION = 3;
 
 const DEFAULTS = {
     resIdx: 1,          // 1024 default for V3 (physics is heavier)
@@ -17,11 +17,11 @@ const DEFAULTS = {
     bnItersIdx: 0,
     greyscale: false,
     uniformDisplay: true,
-    retina: true,
+    retina: false,
     bilinear: false,
     threshOn: false,
     threshSlider: 500,
-    roundMode: 0,
+    roundMode: 2,       // '>1' rounding
     noiseOpacity: 25,   // 0-100 → 0.0-1.0
     shadows: true,
     pointLights: true,
@@ -49,7 +49,7 @@ export class UIManager {
     constructor(callbacks) {
         this.callbacks = callbacks;
         this.settings = loadSettings();
-        this.displayMode = 0;
+        this.displayMode = 3;  // dither mode
 
         // Bind DOM elements
         this.resBtn = document.getElementById('resBtn');
