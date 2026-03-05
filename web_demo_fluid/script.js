@@ -347,6 +347,7 @@ void main() {
 // Advect noise through velocity field + add fresh noise to uncovered areas.
 // Uses the velocity field (at sim resolution) to push the noise texture forward.
 // The fresh noise injection prevents variance collapse in stretched regions.
+// Supports rounding modes: 0=none, 1=all, 2=>1 pixel displacements only.
 const noiseAdvectShader = compileShader(gl.FRAGMENT_SHADER, `#version 300 es
 precision highp float;
 in vec2 vUv;
@@ -355,7 +356,9 @@ uniform sampler2D uVelocity;    // fluid velocity field
 uniform vec2 velTexelSize;      // 1/simRes for velocity conversion
 uniform float dt;
 uniform vec2 noiseTexelSize;    // 1/noiseRes
+uniform vec2 noiseResolution;   // noiseRes x noiseRes
 uniform float seed;
+uniform int roundMode;          // 0=none, 1=all, 2=>1
 out vec4 fc;
 
 uint pcg(uint x) {
@@ -373,24 +376,36 @@ vec2 boxMuller(uint s1, uint s2) {
     return vec2(r * cos(6.2831853 * u2), r * sin(6.2831853 * u2));
 }
 
+float applyRound(float pxDisp) {
+    if (roundMode == 1) return round(pxDisp);
+    if (roundMode == 2 && abs(pxDisp) > 1.0) return round(pxDisp);
+    return pxDisp;
+}
+
 void main() {
     // Sample velocity at this position
     vec2 vel = texture(uVelocity, vUv).xy;
     // Convert velocity to UV displacement: vel is in grid cells/sec
     vec2 uvDisp = vel * dt * velTexelSize;
+    // Convert to pixel displacement for rounding
+    vec2 pxDisp = uvDisp * noiseResolution;
+    pxDisp.x = applyRound(pxDisp.x);
+    pxDisp.y = applyRound(pxDisp.y);
+    // Convert back to UV
+    uvDisp = pxDisp * noiseTexelSize;
+
     // Trace back: where did this pixel come from?
     vec2 srcUv = vUv - uvDisp;
     // Sample noise at source position (bilinear)
     vec4 advected = texture(uNoise, srcUv);
 
-    // Detect out-of-bounds or very stretched regions: inject fresh noise
-    // If source UV is outside [0,1], use fresh noise
+    // Detect out-of-bounds: inject fresh noise
     float oob = step(0.0, srcUv.x) * step(srcUv.x, 1.0)
               * step(0.0, srcUv.y) * step(srcUv.y, 1.0);
 
     // Generate fresh noise for this pixel
-    ivec2 px = ivec2(vUv / noiseTexelSize);
-    uint base = uint(px.y * 4096 + px.x) + uint(seed);
+    ivec2 px = ivec2(vUv * noiseResolution);
+    uint base = uint(px.y) * uint(noiseResolution.x) + uint(px.x) + uint(seed);
     vec2 n1 = boxMuller(base * 4u + 0u, base * 4u + 1u);
     vec2 n2 = boxMuller(base * 4u + 2u, base * 4u + 3u);
     vec4 fresh = vec4(n1.x, n1.y, n2.x, n2.y);
@@ -527,9 +542,17 @@ void main() {
         fc = vec4(clamp(scene + nc, 0.0, 1.0), 1.0);
     } else if (uMode == 3) {  // dither
         vec3 scene = texture(uDye, vUv).rgb;
-        float lum = luminance(scene);
-        float thr = normal_cdf(n.x);
-        fc = lum > thr ? vec4(1.0) : vec4(vec3(0.0), 1.0);
+        if (uGreyscale == 1) {
+            // Greyscale dither: threshold luminance with single noise channel
+            float lum = luminance(scene);
+            float thr = normal_cdf(n.x);
+            fc = lum > thr ? vec4(1.0) : vec4(vec3(0.0), 1.0);
+        } else {
+            // RGB dither: threshold each channel independently
+            vec3 thr = vec3(normal_cdf(n.x), normal_cdf(n.y), normal_cdf(n.z));
+            vec3 d = step(thr, scene);
+            fc = vec4(d, 1.0);
+        }
     } else if (uMode == 4) {  // motion (velocity)
         vec2 vel = texture(uVelocity, vUv).rg;
         fc = vec4(vel * 0.001 + 0.5, 0.5, 1.0);
@@ -786,8 +809,9 @@ function multipleSplats(amount) {
 canvas.addEventListener('mousedown', e => {
     const p = pointers[0];
     p.down = true; p.moved = false;
-    p.texcoordX = scaleByPixelRatio(e.offsetX) / canvas.width;
-    p.texcoordY = 1.0 - scaleByPixelRatio(e.offsetY) / canvas.height;
+    // Use offsetX/offsetY relative to CSS size (not pixel size)
+    p.texcoordX = e.offsetX / canvas.clientWidth;
+    p.texcoordY = 1.0 - e.offsetY / canvas.clientHeight;
     p.prevTexcoordX = p.texcoordX; p.prevTexcoordY = p.texcoordY;
     p.deltaX = 0; p.deltaY = 0; p.color = generateColor();
 });
@@ -796,8 +820,8 @@ canvas.addEventListener('mousemove', e => {
     const p = pointers[0];
     if (!p.down) return;
     p.prevTexcoordX = p.texcoordX; p.prevTexcoordY = p.texcoordY;
-    p.texcoordX = scaleByPixelRatio(e.offsetX) / canvas.width;
-    p.texcoordY = 1.0 - scaleByPixelRatio(e.offsetY) / canvas.height;
+    p.texcoordX = e.offsetX / canvas.clientWidth;
+    p.texcoordY = 1.0 - e.offsetY / canvas.clientHeight;
     let dx = p.texcoordX - p.prevTexcoordX, dy = p.texcoordY - p.prevTexcoordY;
     const ar = canvas.width / canvas.height;
     if (ar < 1) dx *= ar; else dy /= ar;
@@ -810,12 +834,13 @@ window.addEventListener('mouseup', () => { pointers[0].down = false; });
 canvas.addEventListener('touchstart', e => {
     e.preventDefault();
     const t = e.targetTouches;
+    const rect = canvas.getBoundingClientRect();
     while (t.length >= pointers.length) pointers.push(new Pointer());
     for (let i = 0; i < t.length; i++) {
         const p = pointers[i + 1] || pointers[0];
         p.id = t[i].identifier; p.down = true; p.moved = false;
-        p.texcoordX = scaleByPixelRatio(t[i].pageX) / canvas.width;
-        p.texcoordY = 1.0 - scaleByPixelRatio(t[i].pageY) / canvas.height;
+        p.texcoordX = (t[i].clientX - rect.left) / rect.width;
+        p.texcoordY = 1.0 - (t[i].clientY - rect.top) / rect.height;
         p.prevTexcoordX = p.texcoordX; p.prevTexcoordY = p.texcoordY;
         p.deltaX = 0; p.deltaY = 0; p.color = generateColor();
     }
@@ -824,12 +849,13 @@ canvas.addEventListener('touchstart', e => {
 canvas.addEventListener('touchmove', e => {
     e.preventDefault();
     const t = e.targetTouches;
+    const rect = canvas.getBoundingClientRect();
     for (let i = 0; i < t.length; i++) {
         const p = pointers[i + 1] || pointers[0];
         if (!p.down) continue;
         p.prevTexcoordX = p.texcoordX; p.prevTexcoordY = p.texcoordY;
-        p.texcoordX = scaleByPixelRatio(t[i].pageX) / canvas.width;
-        p.texcoordY = 1.0 - scaleByPixelRatio(t[i].pageY) / canvas.height;
+        p.texcoordX = (t[i].clientX - rect.left) / rect.width;
+        p.texcoordY = 1.0 - (t[i].clientY - rect.top) / rect.height;
         let dx = p.texcoordX - p.prevTexcoordX, dy = p.texcoordY - p.prevTexcoordY;
         const ar = canvas.width / canvas.height;
         if (ar < 1) dx *= ar; else dy /= ar;
@@ -928,6 +954,8 @@ function noiseWarpStep(dt) {
     gl.uniform2f(noiseAdvectProgram.uniforms.velTexelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1f(noiseAdvectProgram.uniforms.dt, dt);
     gl.uniform2f(noiseAdvectProgram.uniforms.noiseTexelSize, 1.0/noiseRes, 1.0/noiseRes);
+    gl.uniform2f(noiseAdvectProgram.uniforms.noiseResolution, noiseRes, noiseRes);
+    gl.uniform1i(noiseAdvectProgram.uniforms.roundMode, settings.roundMode);
     noiseSeed = (noiseSeed + 1) | 0;
     gl.uniform1f(noiseAdvectProgram.uniforms.seed, noiseSeed * 999983.0);
     blit(noiseFBO.write);
