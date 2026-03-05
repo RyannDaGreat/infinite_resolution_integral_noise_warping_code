@@ -15,7 +15,7 @@ const DEFAULTS = {
     resIdx: 1,          // 1024 default for V3 (physics is heavier)
     blueNoise: false,
     bnItersIdx: 0,
-    greyscale: false,
+    greyscale: true,
     uniformDisplay: true,
     retina: false,
     bilinear: false,
