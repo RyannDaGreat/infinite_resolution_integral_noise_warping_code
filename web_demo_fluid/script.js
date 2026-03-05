@@ -39,9 +39,12 @@ const DEFAULTS = {
     simRes: 128,
     dyeRes: 1024,
     curl: 30,
-    dissipation: 100,  // /100 = 1.0
-    pressure: 80,      // /100 = 0.8
-    noiseDissipation: 0, // 0 = no dissipation for noise
+    velDissipation: 20,   // /100 = 0.2
+    dyeDissipation: 100,  // /100 = 1.0
+    pressure: 80,         // /100 = 0.8
+    shading: true,
+    colorful: true,
+    autoSplat: true,
 };
 
 function loadSettings() {
@@ -399,10 +402,6 @@ void main() {
     // Sample noise at source position (bilinear)
     vec4 advected = texture(uNoise, srcUv);
 
-    // Detect out-of-bounds: inject fresh noise
-    float oob = step(0.0, srcUv.x) * step(srcUv.x, 1.0)
-              * step(0.0, srcUv.y) * step(srcUv.y, 1.0);
-
     // Generate fresh noise for this pixel
     ivec2 px = ivec2(vUv * noiseResolution);
     uint base = uint(px.y) * uint(noiseResolution.x) + uint(px.x) + uint(seed);
@@ -410,24 +409,33 @@ void main() {
     vec2 n2 = boxMuller(base * 4u + 2u, base * 4u + 3u);
     vec4 fresh = vec4(n1.x, n1.y, n2.x, n2.y);
 
-    // Mix: use advected where in bounds, fresh where out of bounds
-    fc = mix(fresh, advected, oob);
+    // Detect out-of-bounds: use fresh noise
+    float oob = step(0.0, srcUv.x) * step(srcUv.x, 1.0)
+              * step(0.0, srcUv.y) * step(srcUv.y, 1.0);
+    vec4 result = mix(fresh, advected, oob);
+
+    // Small fresh noise injection replenishes high-frequency content lost to
+    // bilinear interpolation. Amplitude is restored separately by normalization pass.
+    fc = mix(result, fresh, 0.005);
 }
 `);
 
 // Normalize noise: rescale to restore mean=0, std=1.
-// Uses stats computed from GPU reduction.
+// Reads stats from 1x1 FBO texture (entirely GPU-side, no CPU readback).
+// Stats FBO format: (sum, sum², count, 0)
 const noiseNormalizeShader = compileShader(gl.FRAGMENT_SHADER, `#version 300 es
 precision highp float;
 in vec2 vUv;
 uniform sampler2D uNoise;
-uniform vec4 stats; // x=mean, y=std, z=0, w=0
+uniform sampler2D uStats;  // 1x1 texture: (sum, sum², count, 0)
 out vec4 fc;
 void main() {
+    vec4 s = texelFetch(uStats, ivec2(0, 0), 0);
+    float mean = s.x / max(s.z, 1.0);
+    float var_ = s.y / max(s.z, 1.0) - mean * mean;
+    float invStd = 1.0 / max(sqrt(max(var_, 0.0)), 0.001);
     vec4 n = texture(uNoise, vUv);
-    // Rescale: (n - mean) / std → gives mean=0, std=1
-    float invStd = 1.0 / max(stats.y, 0.001);
-    fc = (n - stats.x) * invStd;
+    fc = (n - mean) * invStd;
 }
 `);
 
@@ -451,8 +459,8 @@ void main() {
         for (int dx = 0; dx < 2; dx++) {
             vec2 uv = base + vec2(float(dx), float(dy)) * ts;
             vec4 v = texture(uNoise, uv);
-            // Average all 4 channels for a single stat
-            float val = (v.r + v.g + v.b + v.a) * 0.25;
+            // Use R channel only for stats (all channels have same distribution)
+            float val = v.r;
             sum += val;
             sum2 += val * val;
             count += 1.0;
@@ -503,6 +511,8 @@ uniform int uUniform;
 uniform int uThreshOn;
 uniform float uThreshVal;
 uniform float uNoiseOpacity;
+uniform int uShading;
+uniform vec2 dyeTexelSize;
 out vec4 fc;
 
 float erf_approx(float x) {
@@ -533,7 +543,19 @@ void main() {
     if (uMode == 0) {  // noise
         fc = applyThreshold(vec4(noiseToDisplay(n), 1.0));
     } else if (uMode == 1) {  // scene (fluid dye)
-        fc = vec4(texture(uDye, vUv).rgb, 1.0);
+        vec3 c = texture(uDye, vUv).rgb;
+        if (uShading == 1) {
+            vec3 lc = texture(uDye, vUv - vec2(dyeTexelSize.x, 0.0)).rgb;
+            vec3 rc = texture(uDye, vUv + vec2(dyeTexelSize.x, 0.0)).rgb;
+            vec3 tc = texture(uDye, vUv + vec2(0.0, dyeTexelSize.y)).rgb;
+            vec3 bc = texture(uDye, vUv - vec2(0.0, dyeTexelSize.y)).rgb;
+            float dx = length(rc) - length(lc);
+            float dy = length(tc) - length(bc);
+            vec3 norm = normalize(vec3(dx, dy, length(dyeTexelSize)));
+            float diffuse = clamp(dot(norm, vec3(0.0, 0.0, 1.0)) + 0.7, 0.7, 1.0);
+            c *= diffuse;
+        }
+        fc = vec4(c, 1.0);
     } else if (uMode == 2) {  // scene + noise
         vec3 scene = texture(uDye, vUv).rgb;
         vec3 nc;
@@ -730,6 +752,12 @@ function initNoiseFBOs() {
         if (s === 1) break;
         s = Math.ceil(s / 2);
     }
+
+    // Diagnostic: verify noise was generated
+    gl.bindFramebuffer(gl.FRAMEBUFFER, noiseFBO.read.fbo);
+    const diagBuf = new Float32Array(16);
+    gl.readPixels(0, 0, 2, 2, gl.RGBA, gl.FLOAT, diagBuf);
+    console.log('Noise init check (first 4 pixels RGBA):', Array.from(diagBuf));
 }
 
 // ---------------------------------------------------------------------------
@@ -926,14 +954,14 @@ function fluidStep(dt) {
     gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
     gl.uniform1i(advectionProgram.uniforms.uSource, velocity.read.attach(0));
     gl.uniform1f(advectionProgram.uniforms.dt, dt);
-    gl.uniform1f(advectionProgram.uniforms.dissipation, settings.dissipation / 100);
+    gl.uniform1f(advectionProgram.uniforms.dissipation, settings.velDissipation / 100);
     blit(velocity.write);
     velocity.swap();
 
     gl.uniform2f(advectionProgram.uniforms.dyeTexelSize, dye.texelSizeX, dye.texelSizeY);
     gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
     gl.uniform1i(advectionProgram.uniforms.uSource, dye.read.attach(1));
-    gl.uniform1f(advectionProgram.uniforms.dissipation, settings.dissipation / 100);
+    gl.uniform1f(advectionProgram.uniforms.dissipation, settings.dyeDissipation / 100);
     blit(dye.write);
     dye.swap();
 }
@@ -961,26 +989,24 @@ function noiseWarpStep(dt) {
     blit(noiseFBO.write);
     noiseFBO.swap();
 
-    // GPU reduction to compute noise mean/std (every 4 frames for perf)
-    if (noiseSeed % 4 === 0) {
-        computeNoiseStats();
-    }
+    // GPU reduction: compute stats for normalization (every frame, all on GPU)
+    runNoiseReduction();
 
-    // Normalize noise to restore mean=0, std=1
-    if (noiseStats.std > 0.01) {
-        noiseNormalizeProgram.bind();
-        gl.uniform2f(noiseNormalizeProgram.uniforms.texelSize, 1.0/noiseRes, 1.0/noiseRes);
-        gl.uniform1i(noiseNormalizeProgram.uniforms.uNoise, noiseFBO.read.attach(0));
-        gl.uniform4f(noiseNormalizeProgram.uniforms.stats, noiseStats.mean, noiseStats.std, 0, 0);
-        blit(noiseFBO.write);
-        noiseFBO.swap();
-    }
+    // Normalize noise to mean=0, std=1 using stats from 1x1 FBO (no CPU readback)
+    const statsFBO = reduceChain[reduceChain.length - 1];
+    noiseNormalizeProgram.bind();
+    gl.uniform2f(noiseNormalizeProgram.uniforms.texelSize, 1.0/noiseRes, 1.0/noiseRes);
+    gl.uniform1i(noiseNormalizeProgram.uniforms.uNoise, noiseFBO.read.attach(0));
+    gl.uniform1i(noiseNormalizeProgram.uniforms.uStats, statsFBO.attach(1));
+    blit(noiseFBO.write);
+    noiseFBO.swap();
+
+    // Read stats to CPU periodically for display overlay only
+    if (noiseSeed % 30 === 0) readNoiseStatsForDisplay();
 }
 
-function computeNoiseStats() {
+function runNoiseReduction() {
     if (reduceChain.length === 0) return;
-
-    gl.disable(gl.BLEND);
 
     // First reduction: noise → reduceChain[0]
     noiseReduceProgram.bind();
@@ -1000,8 +1026,10 @@ function computeNoiseStats() {
         gl.uniform1i(noiseReduceAccumProgram.uniforms.uStats, src.attach(0));
         blit(dst);
     }
+}
 
-    // Read back the 1x1 final result
+function readNoiseStatsForDisplay() {
+    if (reduceChain.length === 0) return;
     const last = reduceChain[reduceChain.length - 1];
     gl.bindFramebuffer(gl.FRAMEBUFFER, last.fbo);
     const px = new Float32Array(4);
@@ -1035,6 +1063,8 @@ function render() {
     gl.uniform1i(displayProgram.uniforms.uThreshOn, settings.threshOn ? 1 : 0);
     gl.uniform1f(displayProgram.uniforms.uThreshVal, settings.threshSlider / 1000);
     gl.uniform1f(displayProgram.uniforms.uNoiseOpacity, settings.noiseOpacity / 100);
+    gl.uniform1i(displayProgram.uniforms.uShading, settings.shading ? 1 : 0);
+    gl.uniform2f(displayProgram.uniforms.dyeTexelSize, dye.texelSizeX, dye.texelSizeY);
     blit(null);
 }
 
@@ -1062,6 +1092,8 @@ let frameCount = 0;
 let lastFPSTime = Date.now();
 let currentFPS = 0;
 let lastWarpMs = 0;
+let lastColorUpdate = 0;
+let lastAutoSplat = 0;
 
 function update() {
     let now = Date.now();
@@ -1072,6 +1104,19 @@ function update() {
     if (resizeCanvas()) initFramebuffers();
 
     if (splatStack.length > 0) multipleSplats(splatStack.pop());
+
+    // Colorful mode: update pointer colors periodically
+    if (settings.colorful && now - lastColorUpdate > 100) {
+        lastColorUpdate = now;
+        for (const p of pointers) p.color = generateColor();
+    }
+
+    // Auto-splat: inject random splats periodically
+    if (settings.autoSplat && !paused && now - lastAutoSplat > 3000) {
+        lastAutoSplat = now;
+        multipleSplats(Math.floor(Math.random() * 3) + 1);
+    }
+
     pointers.forEach(p => {
         if (p.moved) {
             p.moved = false;
@@ -1143,12 +1188,20 @@ function syncUI() {
     el('noiseOpacityLabel').textContent = (s.noiseOpacity / 100).toFixed(2);
     el('curlSlider').value = s.curl;
     el('curlLabel').textContent = s.curl;
-    el('dissipSlider').value = s.dissipation;
-    el('dissipLabel').textContent = (s.dissipation / 100).toFixed(2);
+    el('velDissipSlider').value = s.velDissipation;
+    el('velDissipLabel').textContent = (s.velDissipation / 100).toFixed(2);
+    el('dyeDissipSlider').value = s.dyeDissipation;
+    el('dyeDissipLabel').textContent = (s.dyeDissipation / 100).toFixed(2);
     el('pressureSlider').value = s.pressure;
     el('pressureLabel').textContent = (s.pressure / 100).toFixed(2);
     el('simResSelect').value = s.simRes;
     el('dyeResSelect').value = s.dyeRes;
+    el('shadingBtn').textContent = `Shading: ${s.shading ? 'ON' : 'OFF'}`;
+    el('shadingBtn').classList.toggle('on', s.shading);
+    el('colorfulBtn').textContent = `Colorful: ${s.colorful ? 'ON' : 'OFF'}`;
+    el('colorfulBtn').classList.toggle('on', s.colorful);
+    el('autoSplatBtn').textContent = `Auto: ${s.autoSplat ? 'ON' : 'OFF'}`;
+    el('autoSplatBtn').classList.toggle('on', s.autoSplat);
     canvas.style.imageRendering = s.bilinear ? 'auto' : 'pixelated';
 
     document.querySelectorAll('.modeBtn').forEach(btn => {
@@ -1172,7 +1225,8 @@ function setupUI() {
     el('uniformBtn').addEventListener('click', () => { settings.uniformDisplay = !settings.uniformDisplay; persist(); syncUI(); });
     el('retinaBtn').addEventListener('click', () => {
         settings.retina = !settings.retina; persist(); syncUI();
-        resizeCanvas(); initFramebuffers();
+        resizeCanvas(); initFramebuffers(); initNoiseFBOs();
+        lastUpdateTime = Date.now(); // prevent huge dt spike
     });
     el('interpBtn').addEventListener('click', () => { settings.bilinear = !settings.bilinear; persist(); syncUI(); });
     el('roundBtn').addEventListener('click', () => {
@@ -1189,8 +1243,12 @@ function setupUI() {
     el('splatBtn').addEventListener('click', () => { splatStack.push(Math.floor(Math.random() * 20) + 5); });
     el('noiseOpacitySlider').addEventListener('input', function() { settings.noiseOpacity = parseInt(this.value); persist(); syncUI(); });
     el('curlSlider').addEventListener('input', function() { settings.curl = parseInt(this.value); persist(); syncUI(); });
-    el('dissipSlider').addEventListener('input', function() { settings.dissipation = parseInt(this.value); persist(); syncUI(); });
+    el('velDissipSlider').addEventListener('input', function() { settings.velDissipation = parseInt(this.value); persist(); syncUI(); });
+    el('dyeDissipSlider').addEventListener('input', function() { settings.dyeDissipation = parseInt(this.value); persist(); syncUI(); });
     el('pressureSlider').addEventListener('input', function() { settings.pressure = parseInt(this.value); persist(); syncUI(); });
+    el('shadingBtn').addEventListener('click', () => { settings.shading = !settings.shading; persist(); syncUI(); });
+    el('colorfulBtn').addEventListener('click', () => { settings.colorful = !settings.colorful; persist(); syncUI(); });
+    el('autoSplatBtn').addEventListener('click', () => { settings.autoSplat = !settings.autoSplat; persist(); syncUI(); });
     el('simResSelect').addEventListener('change', function() {
         settings.simRes = parseInt(this.value); persist(); syncUI(); initFramebuffers();
     });
