@@ -70,6 +70,27 @@ async function main() {
             console.log('WARNING: No noise stats available (WebGPU may not be available in headless mode)');
         }
 
+        // --- Star warp mode ---
+        // Switch to Stars mode via the mode bar, wait for dynamics + a stats
+        // readback (every 60 frames), then validate uniformity of the field.
+        await page.click('.modeBtn[data-mode="6"]');
+        await sleep(4000);
+        const starStats = await page.evaluate(() => window.__starStats);
+        if (starStats) {
+            console.log(`Star stats: n=${starStats.numStars} sample=${starStats.sample} ` +
+                        `inBounds=${(starStats.inBoundsFrac * 100).toFixed(1)}% ` +
+                        `min/mean=${starStats.minOverMean.toFixed(3)} max/mean=${starStats.maxOverMean.toFixed(3)}`);
+            // 4x4 grid over a 10k-star sample: ~625/cell, sigma ~4%. Uniformity
+            // failures (the v1 Jacobian bug class) show cells near 0 or 2x.
+            const inBoundsOk = starStats.inBoundsFrac === 1;
+            const uniformOk = starStats.minOverMean > 0.8 && starStats.maxOverMean < 1.2;
+            console.log(`  all stars in bounds: ${inBoundsOk ? 'PASS' : 'FAIL'}`);
+            console.log(`  uniform star field:  ${uniformOk ? 'PASS' : 'FAIL'}`);
+            if (!inBoundsOk || !uniformOk) process.exit(1);
+        } else {
+            console.log('WARNING: No star stats available (WebGPU may not be available in headless mode)');
+        }
+
         // Check for JS errors
         if (errors.length > 0) {
             console.error('Console errors:', errors);

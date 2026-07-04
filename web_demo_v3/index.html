@@ -74,6 +74,7 @@
             <button class="modeBtn" data-mode="3" title="[4] Dither">4:Dither</button>
             <button class="modeBtn" data-mode="4" title="[5] Motion">5:Motion</button>
             <button class="modeBtn" data-mode="5" title="[6] Raw">6:Raw</button>
+            <button class="modeBtn" data-mode="6" title="[7] Star warp: N points ride the motion field, uniform every frame">7:Stars</button>
         </span>
         <span class="sep">|</span>
         <button id="lockNoiseBtn" title="Freeze noise in place — no warp updates">[L] Lock: OFF</button>
@@ -98,6 +99,13 @@
             <input type="range" id="noiseOpacitySlider" min="0" max="100" value="25" title="Noise opacity in S+N mode" style="width:80px; vertical-align:middle; accent-color:#48c;">
             <span id="noiseOpacityLabel" style="font-size:11px; min-width:30px; display:inline-block;">0.25</span>
         </span>
+        <span id="starSettings" style="display:none;">
+            <span class="sep">|</span>
+            <span style="font-size:11px;">Stars:</span>
+            <input type="range" id="starCountSlider" min="0" max="100" value="50" title="Star count (log scale: 100 to 1M)" style="width:100px; vertical-align:middle; accent-color:#48c;">
+            <span id="starCountLabel" style="font-size:11px; min-width:36px; display:inline-block;">10k</span>
+            <button id="starAABtn" title="Antialiased stars: linear-light tent splat + sRGB display — constant perceived brightness at any subpixel position">AA: ON</button>
+        </span>
     </nav>
 
     <div id="canvas-container">
@@ -107,10 +115,10 @@
             Click to capture mouse<br>
             WASD — move | Shift — sprint | Space — jump<br>
             Click — shoot sphere<br>
-            1-6 — display modes | ESC — release<br>
+            1-7 — display modes | ESC — release<br>
             R — reset scene | M — slow-mo | L — lock noise
         </div>
-        <div id="hint" class="overlay">ESC release | Click shoot | Space jump | Shift sprint | 1-6 modes | L lock | R reset | M slow-mo</div>
+        <div id="hint" class="overlay">ESC release | Click shoot | Space jump | Shift sprint | 1-7 modes | L lock | R reset | M slow-mo</div>
     </div>
     <div id="error"></div>
 

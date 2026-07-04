@@ -70,3 +70,35 @@
 - **User requirement**: Per-mode settings (opacity slider only visible in S+N mode)
 - **User requirement**: Sprint mechanic (Shift to run faster)
 - **Bevel approach**: "Generate at final dimensions" per bevel research. Avoids non-uniform scale issues. Blender's bevel modifier has the same problem — their answer is "Apply Scale" which is equivalent.
+
+## 2026-07-04: Session — Star Warp Mode (branch star_warp_mode)
+
+### Plan
+- New display mode 7 "Stars": N points advected by the motion field with the
+  splat-density death/birth algorithm (per-frame uniform star field — see the
+  StarWarp project manifest above this repo for the algorithm's derivation and the
+  v1 Jacobian failure history).
+- All-GPU: splat (CAS float atomics) → row prefix scans → CDF → per-star update with
+  2-level CDF binary-search births. Noise warp passes skipped while in Stars mode.
+- Variable N via log slider (10^2..10^6, default 10^4), MAX_STARS = 2^20 preallocated.
+- Toggleable AA: linear-light tent splat into rgba16float starTex + sRGB OETF at
+  display → per-star luminance exactly invariant under subpixel position.
+- SETTINGS_VERSION 3 → 4 (new starCount/starAA defaults; forces settings reset).
+
+### Risks
+- CAS float-atomic contention in starSplat at 2048² (same idiom as brownian pass).
+- Headless WebGPU may be unavailable (existing test already tolerates).
+
+### Results (same day)
+- All modules parse; WGSL compiles clean (no console errors beyond pre-existing
+  favicon 404).
+- Headless (real WebGPU, 1024²): noise mode unchanged (mean 0.000, std 1.000);
+  Stars mode 10k stars: 100% in-bounds, 4×4 grid min/mean 0.949, max/mean 1.062.
+- Under 5 s of walking+strafing (deaths/births firing): min/mean 0.891,
+  max/mean 1.066 — uniform under motion. PASS.
+- N = 1,000,000 stars: 60 fps, GPU total 7.3 ms, min/mean 0.968, max/mean 1.029.
+  At 1024² that's ~95% pixel occupancy — visually the thresholded-noise limit.
+- Fixed during implementation: blue-noise restore had to be gated on !starsMode —
+  in Stars mode no backup is taken that frame, so the unconditional restore would
+  have copied a STALE backup over noiseBuf (same bug class as the lock-restore
+  bug from Session 2 — restore paths must be gated by every warp-skipping mode).

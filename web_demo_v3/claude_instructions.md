@@ -173,6 +173,7 @@ All settings saved to localStorage (`iinw_v3_settings`), restored on page load.
 
 ### Per-Mode Settings
 - **S+N mode (mode 3)**: Noise opacity slider appears (0.0–1.0, default 0.25). Controls how much noise is blended over the scene.
+- **Stars mode (mode 7)**: Star count slider (log scale 10²–10⁶, default 10⁴) and AA toggle button appear. AA has no hotkey — letter keys conflict with WASD movement.
 
 ### Display Modes (clickable toolbar + keys 1-6)
 | Key | Name | Description |
@@ -183,6 +184,55 @@ All settings saved to localStorage (`iinw_v3_settings`), restored on page load.
 | 4 | Dither | B&W dithering: threshold scene luminance with noise CDF |
 | 5 | Motion | Motion vector visualization (RG = motion × 5 + 0.5) |
 | 6 | Raw | Raw noise with threshold and display flags |
+| 7 | Stars | Star warp: N points advected by the motion field, per-frame uniform (see Star Warp Mode section) |
+
+### Star Warp Mode (mode 7 / index 6)
+
+The point-process analog of the noise warp: N white point "stars" ride the motion
+field, and every frozen frame is indistinguishable from N uniform-random points. No
+flow can create persistent over/under-density. (Full algorithm derivation, proofs, and
+the v1-Jacobian-failure history live in the StarWarp project manifest one level above
+this repo; this section documents the GPU integration.)
+
+Per frame in Stars mode (noise-warp compute passes are SKIPPED — the modes are
+mutually exclusive displays, freeing the ~12 ms warp budget):
+
+1. `clearBuffer(starDensityBuf)`
+2. **starSplat** (W·H threads): each pixel forward-advects unit mass by its motion
+   vector — pixel flow = (+motion.r·W, −motion.g·H) — and bilinearly splats it into
+   the density buffer via CAS float atomics. Result E: 1 = unchanged, 0 = uncovered,
+   >1 = pile-up. E is the transported density (NOT the Jacobian, which misses
+   translations/fold-overs).
+3. **starScanRows** (H threads): deficit = max(1 − E, 0); per-row inclusive prefix
+   sums (last column = row total).
+4. **starScanCdf** (1 thread): prefix over row totals → row CDF; last entry = total.
+5. **starUpdate** (N threads): advect star by bilinearly-sampled motion (at its OLD
+   position); death = out-of-frame OR crowding (survive w.p. 1/max(E,1), E sampled at
+   the NEW position, PCG RNG); dead stars respawn via 2-level CDF binary search
+   (row, then column within row) + tent jitter, reflected at borders. If total
+   deficit ≈ 0, respawn uniformly (quota: star count is exactly N every frame).
+6. **starRender**: N·6 vertices (a quad per star) into starTex (rgba16float,
+   additive blend); display mode 6 reads starTex over a black background.
+
+**Antialiasing (toggleable, default ON)**: AA renders each star as a tent-kernel
+footprint in LINEAR light; the display pass applies the sRGB OETF at the very end.
+The unit tent is a partition of unity, so total luminance per star is exactly
+invariant under subpixel position — no brightness flicker as stars cross pixels.
+(Summing coverage in sRGB space would make a split star look ~half as bright.)
+Tent radius = max(1, round(W/1024)) texels, integer to keep the exactness. AA OFF
+draws hard weight-1 quads (retro single-pixel look); 0/1 are sRGB fixed points so
+both paths share one display shader.
+
+- **Variable N**: log-scale slider 10²…10⁶ (decades at 0/25/50/75/100), default 10⁴,
+  visible only in Stars mode, persisted. MAX_STARS = 2^20 preallocated (8 MB); N is a
+  uniform. All positions are seeded uniform at init, so raising N exposes
+  stale-but-uniform stars — spatially valid, artifact-free.
+- **Lock [L]** freezes the star field too (star compute skipped, render still runs).
+- Buffers: starBuf (MAX_STARS·2 f32), starDensityBuf (N f32, atomic-CAS written),
+  starRowPrefixBuf (N f32), starRowCdfBuf (H f32), starUniformBuf, starRenderUniformBuf,
+  starTex (rgba16float), _starStagingBuf (stats readback).
+- Headless validation: `window.__starStats` = periodic readback of ≤65536 star
+  positions → in-bounds fraction + 4×4 coarse-grid min/mean & max/mean.
 
 ### Noise Lock Behavior
 When lock is engaged:
@@ -340,6 +390,11 @@ When a sphere is spawned, its first frame has prevModel == model (zero motion). 
 2. **Physics loads**: Rapier initializes without error
 3. **Instance count**: >0 instances rendered (dominoes exist)
 4. **Screenshot**: capture noise view for visual validation
+5. **Star warp** (in test_headless.mjs): switch to Stars mode, validate
+   window.__starStats — 100% in-bounds, 4×4 grid min/mean > 0.8, max/mean < 1.2
+6. **Star warp under motion** (test_stars_motion.mjs): walk/strafe for 5 s in
+   Stars mode (exercises deaths/births), re-validate uniformity; AA on/off
+   screenshots; N = 10⁶ stress (must hold 60 fps and stay uniform)
 
 ### Manual
 1. WASD movement + mouse look works

@@ -5,11 +5,30 @@
 
 const RESOLUTIONS = [2048, 1024, 512, 256];
 const BN_ITERS_OPTIONS = [2, 5, 10];
-const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw'];
+const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 'stars'];
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 3;
+const SETTINGS_VERSION = 4;
+
+/**
+ * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
+ * Decades land on round slider values: 0→100, 25→1k, 50→10k, 75→100k, 100→1M.
+ *
+ * Examples:
+ *   >>> starCountFromSlider(50)   // 10000
+ *   >>> starCountFromSlider(100)  // 1000000
+ */
+function starCountFromSlider(v) {
+    return Math.round(10 ** (2 + v / 25));
+}
+
+/** Pure function. Compact star-count label: 100 → "100", 10000 → "10k", 1000000 → "1.0M". */
+function formatStarCount(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return Math.round(n / 1e3) + 'k';
+    return String(n);
+}
 
 const DEFAULTS = {
     resIdx: 1,          // 1024 default for V3 (physics is heavier)
@@ -28,6 +47,8 @@ const DEFAULTS = {
     terrain: true,
     shadowResIdx: 3,    // 4096 default
     daySpeed: 20,       // 0-300 → 0.0-3.0 multiplier (20 = 0.2x = 5x slower)
+    starCount: 50,      // log slider → 10^4 stars (see starCountFromSlider)
+    starAA: true,       // antialiased stars (linear-light tent, constant brightness)
 };
 
 function loadSettings() {
@@ -68,6 +89,10 @@ export class UIManager {
         this.noiseOpacitySlider = document.getElementById('noiseOpacitySlider');
         this.noiseOpacityLabel = document.getElementById('noiseOpacityLabel');
         this.modeSettingsEl = document.getElementById('modeSettings');
+        this.starSettingsEl = document.getElementById('starSettings');
+        this.starCountSlider = document.getElementById('starCountSlider');
+        this.starCountLabel = document.getElementById('starCountLabel');
+        this.starAABtn = document.getElementById('starAABtn');
         this.resetSceneBtn = document.getElementById('resetSceneBtn');
         this.slowMoBtn = document.getElementById('slowMoBtn');
         this.timeMiddayBtn = document.getElementById('timeMidday');
@@ -135,6 +160,12 @@ export class UIManager {
         this.modeSettingsEl.style.display = (this.displayMode === 2) ? 'inline' : 'none';
         this.noiseOpacitySlider.value = s.noiseOpacity;
         this.noiseOpacityLabel.textContent = (s.noiseOpacity / 100).toFixed(2);
+        // Star count slider + AA toggle (visible only in Stars mode)
+        this.starSettingsEl.style.display = (this.displayMode === 6) ? 'inline' : 'none';
+        this.starCountSlider.value = s.starCount;
+        this.starCountLabel.textContent = formatStarCount(starCountFromSlider(s.starCount));
+        this.starAABtn.textContent = `AA: ${s.starAA ? 'ON' : 'OFF'}`;
+        this.starAABtn.classList.toggle('on', s.starAA);
         // Sync mode bar
         for (const btn of this.modeBtns) {
             btn.classList.toggle('on', parseInt(btn.dataset.mode) === this.displayMode);
@@ -160,6 +191,8 @@ export class UIManager {
         renderer.pointLightsEnabled = s.pointLights;
         renderer.terrainEnabled = s.terrain;
         renderer.daySpeedMultiplier = s.daySpeed / 100;
+        renderer.numStars = starCountFromSlider(s.starCount);
+        renderer.starAAEnabled = s.starAA;
     }
 
     /**
@@ -219,6 +252,10 @@ export class UIManager {
         this.noiseOpacitySlider.addEventListener('input', () => {
             s.noiseOpacity = parseInt(this.noiseOpacitySlider.value); update();
         });
+        this.starCountSlider.addEventListener('input', () => {
+            s.starCount = parseInt(this.starCountSlider.value); update();
+        });
+        this.starAABtn.addEventListener('click', () => { s.starAA = !s.starAA; update(); });
         this.shadowsBtn.addEventListener('click', () => { s.shadows = !s.shadows; update(); });
         this.pointLightsBtn.addEventListener('click', () => { s.pointLights = !s.pointLights; update(); });
         this.terrainBtn.addEventListener('click', () => { s.terrain = !s.terrain; update(); });
@@ -257,7 +294,7 @@ export class UIManager {
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
             if (e.metaKey || e.ctrlKey) return;
-            if (e.code >= 'Digit1' && e.code <= 'Digit6') {
+            if (e.code >= 'Digit1' && e.code <= 'Digit7') {
                 this.displayMode = parseInt(e.code.slice(5)) - 1;
                 this.syncUI();
             }

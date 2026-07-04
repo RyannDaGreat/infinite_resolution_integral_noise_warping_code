@@ -8,10 +8,16 @@ import {
     sceneWGSL, skyWGSL, shadowWGSL, displayWGSL,
     buildDeformWGSL, backwardMapWGSL, brownianWGSL, normalizeWGSL,
     blueNoiseBlurWGSL,
+    starSplatWGSL, starScanRowsWGSL, starScanCdfWGSL, starUpdateWGSL, starRenderWGSL,
 } from './shaders.js';
 import { MAX_INSTANCES, FLOATS_PER_INSTANCE, TERRAIN_INSTANCE_IDX } from './scene.js';
 
 const NUM_TIMESTAMPS = 12;
+
+// Star warp mode (display mode index 6, toolbar "7:Stars")
+export const STARS_MODE = 6;
+export const MAX_STARS = 1 << 20;      // preallocated star capacity; active N is a uniform
+const STAR_STATS_SAMPLE = 65536;       // positions read back for headless uniformity stats
 
 const BN_INV_SIGMA_TABLE = [
     1.083608, 1.035389, 1.023437, 1.017777, 1.014435,
@@ -168,6 +174,9 @@ export class WebGPURenderer {
         this.noiseOpacity = 0.25;
         this.noiseLocked = false;
         this._wasLocked = false;
+        this.numStars = 10000;
+        this.starAAEnabled = true;
+        this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
         this.pointLightsEnabled = true;
@@ -201,6 +210,7 @@ export class WebGPURenderer {
         this._createVertexBuffers();
         this._initProfiler();
         this._initNoise();
+        this._initStars();
     }
 
     destroy() {
@@ -208,6 +218,7 @@ export class WebGPURenderer {
         this.motionTex?.destroy();
         this.depthTex?.destroy();
         this.shadowTex?.destroy();
+        this.starTex?.destroy();
 
         const bufs = [
             this.noiseBuf, this.bufferBuf, this.totalRequestBuf, this.ticketCountBuf,
@@ -218,6 +229,8 @@ export class WebGPURenderer {
             this.bnBackupBuf,
             this.bnBlurHUniformBuf,
             ...(this.bnBlurVUniformBufs || []),
+            this.starBuf, this.starDensityBuf, this.starRowPrefixBuf, this.starRowCdfBuf,
+            this.starUniformBuf, this.starRenderUniformBuf, this._starStagingBuf,
             this.boxVB, this.sphereVB, this.quadVB, this.terrainVB,
         ];
         if (this.hasTimestamps) bufs.push(this.querySet, this.tsResolveBuf, this.tsReadBuf);
@@ -247,10 +260,17 @@ export class WebGPURenderer {
             size: [this.shadowResolution, this.shadowResolution], format: 'depth32float',
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
+        // Star coverage accumulator: LINEAR-light tent splats, sRGB-encoded at display.
+        // rgba16float so additive blending of fractional coverage doesn't quantize.
+        this.starTex = device.createTexture({
+            size: [W, H], format: 'rgba16float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
         this.colorTexView  = this.colorTex.createView();
         this.motionTexView = this.motionTex.createView();
         this.depthTexView  = this.depthTex.createView();
         this.shadowTexView = this.shadowTex.createView({ aspect: 'depth-only' });
+        this.starTexView   = this.starTex.createView();
     }
 
     _createBuffers() {
@@ -307,6 +327,25 @@ export class WebGPURenderer {
 
         this._statsStagingBuf = device.createBuffer({
             size: N * C * f4,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+
+        // --- Star warp buffers ---
+        this.starBuf = device.createBuffer({           // (x, y) per star, pixel coords
+            size: MAX_STARS * 2 * f4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        });
+        this.starDensityBuf   = storage(N * f4, GPUBufferUsage.COPY_DST);  // E (CAS-atomic f32)
+        this.starRowPrefixBuf = storage(N * f4);       // per-row deficit prefix sums
+        this.starRowCdfBuf    = storage(this.H * f4);  // row CDF; last entry = total deficit
+        this.starUniformBuf = device.createBuffer({
+            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.starRenderUniformBuf = device.createBuffer({
+            size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this._starStagingBuf = device.createBuffer({
+            size: STAR_STATS_SAMPLE * 2 * f4,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
 
@@ -446,6 +485,30 @@ export class WebGPURenderer {
         this.brownianPipeline    = computePipeline(brownianMod, { WG_SIZE: this.brownianWG });
         this.normalizePipeline   = computePipeline(normalizeMod);
         this.bnBlurPipeline      = computePipeline(mod(blueNoiseBlurWGSL));
+
+        // Star warp pipelines
+        this.starSplatPipeline   = computePipeline(mod(starSplatWGSL));
+        this.starScanRowsPipeline = computePipeline(mod(starScanRowsWGSL));
+        this.starScanCdfPipeline = computePipeline(mod(starScanCdfWGSL));
+        this.starUpdatePipeline  = computePipeline(mod(starUpdateWGSL));
+
+        // Star render: additive blending accumulates LINEAR-light tent coverage.
+        const starModule = mod(starRenderWGSL);
+        this.starRenderPipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: { module: starModule, entryPoint: 'vs' },
+            fragment: {
+                module: starModule, entryPoint: 'fs',
+                targets: [{
+                    format: 'rgba16float',
+                    blend: {
+                        color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+                        alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+                    },
+                }],
+            },
+            primitive: { topology: 'triangle-list' },
+        });
     }
 
     _createBindGroups() {
@@ -496,6 +559,51 @@ export class WebGPURenderer {
                 { binding: 1, resource: this.colorTexView },
                 { binding: 2, resource: this.motionTexView },
                 { binding: 3, resource: buf(this.displayUniformBuf) },
+                { binding: 4, resource: this.starTexView },
+            ],
+        });
+
+        // Star warp bind groups
+        this.starSplatBindGroup = device.createBindGroup({
+            layout: this.starSplatPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.starUniformBuf) },
+                { binding: 1, resource: this.motionTexView },
+                { binding: 2, resource: buf(this.starDensityBuf) },
+            ],
+        });
+        this.starScanRowsBindGroup = device.createBindGroup({
+            layout: this.starScanRowsPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.starUniformBuf) },
+                { binding: 1, resource: buf(this.starDensityBuf) },
+                { binding: 2, resource: buf(this.starRowPrefixBuf) },
+            ],
+        });
+        this.starScanCdfBindGroup = device.createBindGroup({
+            layout: this.starScanCdfPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.starUniformBuf) },
+                { binding: 1, resource: buf(this.starRowPrefixBuf) },
+                { binding: 2, resource: buf(this.starRowCdfBuf) },
+            ],
+        });
+        this.starUpdateBindGroup = device.createBindGroup({
+            layout: this.starUpdatePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.starUniformBuf) },
+                { binding: 1, resource: this.motionTexView },
+                { binding: 2, resource: buf(this.starDensityBuf) },
+                { binding: 3, resource: buf(this.starRowPrefixBuf) },
+                { binding: 4, resource: buf(this.starRowCdfBuf) },
+                { binding: 5, resource: buf(this.starBuf) },
+            ],
+        });
+        this.starRenderBindGroup = device.createBindGroup({
+            layout: this.starRenderPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.starRenderUniformBuf) },
+                { binding: 1, resource: buf(this.starBuf) },
             ],
         });
 
@@ -649,6 +757,23 @@ export class WebGPURenderer {
         this._updateBlurUniforms();
     }
 
+    /**
+     * Seed ALL MAX_STARS positions uniformly over [0, W] x [0, H], not just the
+     * active N: raising N mid-run then exposes stale-but-uniform stars, which is
+     * spatially valid (uniform is uniform) and artifact-free.
+     * Not pure: writes to GPU buffer.
+     */
+    _initStars() {
+        const { H, W, device } = this;
+        const rng = makeRng(777);
+        const data = new Float32Array(MAX_STARS * 2);
+        for (let i = 0; i < MAX_STARS; i++) {
+            data[i * 2]     = rng() * W;
+            data[i * 2 + 1] = rng() * H;
+        }
+        device.queue.writeBuffer(this.starBuf, 0, data);
+    }
+
     _updateBlurUniforms() {
         const { H, W, device } = this;
         const D0 = Math.min(H, W) / this.blueNoiseCutoffDivider;
@@ -719,6 +844,8 @@ export class WebGPURenderer {
         const { device, W, H, N } = this;
         const workgroups256 = Math.ceil(N / 256);
         const brownianWGs = Math.ceil(N / this.brownianWG);
+        const starsMode = displayMode === STARS_MODE;
+        const numStars = Math.min(this.numStars, MAX_STARS);
 
         // Day/night cycle: base period 300 seconds, scaled by daySpeedMultiplier.
         // daySpeedMultiplier=0 freezes time; 1.0 = original 5-min cycle; 3.0 = 100s cycle.
@@ -921,7 +1048,9 @@ export class WebGPURenderer {
         const justLocked = this.noiseLocked && !this._wasLocked;
         this._wasLocked = this.noiseLocked;
 
-        if (!this.noiseLocked) {
+        // Stars mode replaces the noise warp entirely (mutually exclusive
+        // displays) — skipping the warp frees its ~12ms GPU budget.
+        if (!this.noiseLocked && !starsMode) {
 
         // --- Build deformation ---
         const deformPass = encoder.beginComputePass(
@@ -984,6 +1113,66 @@ export class WebGPURenderer {
             this._encodeBlueNoise(encoder, workgroups256);
         }
 
+        // --- Star warp (Stars display mode only) ---
+        if (starsMode) {
+            device.queue.writeBuffer(this.starUniformBuf, 0,
+                new Uint32Array([W, H, frameSeed, numStars]));
+
+            // Render uniform: tent radius (integer for exact partition-of-unity
+            // brightness invariance) and hard-quad half-extent both scale with
+            // resolution so stars stay visible at 2048².
+            const tentRadius = Math.max(1, Math.round(W / 1024));
+            const hardHalf = Math.max(0.5, W / 2048);
+            const srBuf = new ArrayBuffer(32);
+            const srU32 = new Uint32Array(srBuf);
+            const srF32 = new Float32Array(srBuf);
+            srU32[0] = W; srU32[1] = H; srU32[2] = numStars;
+            srU32[3] = this.starAAEnabled ? 1 : 0;
+            srF32[4] = tentRadius; srF32[5] = hardHalf;
+            device.queue.writeBuffer(this.starRenderUniformBuf, 0, srBuf);
+
+            // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
+            if (!this.noiseLocked) {
+                encoder.clearBuffer(this.starDensityBuf);
+
+                const splatPass = encoder.beginComputePass();
+                splatPass.setPipeline(this.starSplatPipeline);
+                splatPass.setBindGroup(0, this.starSplatBindGroup);
+                splatPass.dispatchWorkgroups(workgroups256);
+                splatPass.end();
+
+                const scanRowsPass = encoder.beginComputePass();
+                scanRowsPass.setPipeline(this.starScanRowsPipeline);
+                scanRowsPass.setBindGroup(0, this.starScanRowsBindGroup);
+                scanRowsPass.dispatchWorkgroups(Math.ceil(H / 64));
+                scanRowsPass.end();
+
+                const scanCdfPass = encoder.beginComputePass();
+                scanCdfPass.setPipeline(this.starScanCdfPipeline);
+                scanCdfPass.setBindGroup(0, this.starScanCdfBindGroup);
+                scanCdfPass.dispatchWorkgroups(1);
+                scanCdfPass.end();
+
+                const updatePass = encoder.beginComputePass();
+                updatePass.setPipeline(this.starUpdatePipeline);
+                updatePass.setBindGroup(0, this.starUpdateBindGroup);
+                updatePass.dispatchWorkgroups(Math.ceil(numStars / 256));
+                updatePass.end();
+            }
+
+            // Accumulate LINEAR-light star coverage into starTex (additive blend).
+            const starPass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: this.starTexView,
+                    loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0],
+                }],
+            });
+            starPass.setPipeline(this.starRenderPipeline);
+            starPass.setBindGroup(0, this.starRenderBindGroup);
+            starPass.draw(numStars * 6);
+            starPass.end();
+        }
+
         // --- Display ---
         const canvasView = this.ctx.getCurrentTexture().createView();
         const dispPass = encoder.beginRenderPass({
@@ -1002,8 +1191,10 @@ export class WebGPURenderer {
         dispPass.draw(this.quadVertCount);
         dispPass.end();
 
-        // Restore noise after blue noise display (skip when locked — noiseBuf is the snapshot)
-        if (!this.noiseLocked && this.blueNoiseEnabled) {
+        // Restore noise after blue noise display (skip when locked — noiseBuf is
+        // the snapshot; skip in stars mode — no backup was taken this frame, so
+        // restoring would copy a STALE backup over the noise).
+        if (!this.noiseLocked && this.blueNoiseEnabled && !starsMode) {
             encoder.copyBufferToBuffer(this.bnBackupBuf, 0, this.noiseBuf, 0, N * this.C * 4);
         }
 
@@ -1017,6 +1208,13 @@ export class WebGPURenderer {
         if (this.frameCount % 60 === 0 && !this._statsMapping) {
             encoder.copyBufferToBuffer(this.noiseBuf, 0, this._statsStagingBuf, 0, N * this.C * 4);
             this._statsNeedRead = true;
+        }
+
+        // Star stats readback (headless validation: uniformity + in-bounds)
+        const starSample = Math.min(numStars, STAR_STATS_SAMPLE);
+        if (starsMode && this.frameCount % 60 === 0 && !this._starStatsMapping) {
+            encoder.copyBufferToBuffer(this.starBuf, 0, this._starStagingBuf, 0, starSample * 2 * 4);
+            this._starStatsNeedRead = true;
         }
 
         device.queue.submit([encoder.finish()]);
@@ -1044,7 +1242,55 @@ export class WebGPURenderer {
             }).catch(() => { this._statsMapping = false; });
         }
 
+        // Async star stats readback
+        if (this._starStatsNeedRead) {
+            this._starStatsMapping = true;
+            this._starStatsNeedRead = false;
+            this._starStagingBuf.mapAsync(GPUMapMode.READ).then(() => {
+                const data = new Float32Array(this._starStagingBuf.getMappedRange().slice(0));
+                this._starStagingBuf.unmap();
+                this._computeStarStats(data.subarray(0, starSample * 2), numStars);
+                this._starStatsMapping = false;
+            }).catch(() => { this._starStatsMapping = false; });
+        }
+
         this.frameCount++;
+    }
+
+    /**
+     * Uniformity + validity stats over a sample of star positions.
+     * Coarse 4x4 grid occupancy: min/mean and max/mean should be ~1 for a
+     * uniform field (the whole point of the star warp algorithm).
+     * Not pure: publishes window.__starStats.
+     *
+     * Args:
+     *   data (Float32Array): [sample*2] interleaved (x, y) pixel coords
+     *   numStars (number): active star count (reported, not sampled)
+     */
+    _computeStarStats(data, numStars) {
+        const { W, H } = this;
+        const GRID = 4;
+        const cells = new Array(GRID * GRID).fill(0);
+        const sample = data.length / 2;
+        let inBounds = 0;
+        for (let i = 0; i < sample; i++) {
+            const x = data[i * 2], y = data[i * 2 + 1];
+            if (x >= 0 && x <= W && y >= 0 && y <= H) {
+                inBounds++;
+                const gx = Math.min(GRID - 1, Math.floor(x / W * GRID));
+                const gy = Math.min(GRID - 1, Math.floor(y / H * GRID));
+                cells[gy * GRID + gx]++;
+            }
+        }
+        const mean = inBounds / cells.length;
+        this.starStats = {
+            numStars,
+            sample,
+            inBoundsFrac: inBounds / sample,
+            minOverMean: mean > 0 ? Math.min(...cells) / mean : 0,
+            maxOverMean: mean > 0 ? Math.max(...cells) / mean : 0,
+        };
+        if (typeof window !== 'undefined') window.__starStats = this.starStats;
     }
 
     // -----------------------------------------------------------------------

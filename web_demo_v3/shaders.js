@@ -1168,6 +1168,7 @@ struct VsOut {
 @group(0) @binding(0) var<storage, read> noiseData: array<f32>;
 @group(0) @binding(1) var colorTex:  texture_2d<f32>;
 @group(0) @binding(2) var motionTex: texture_2d<f32>;
+@group(0) @binding(4) var starTex:   texture_2d<f32>;
 
 struct DisplayUniforms {
     mode:  u32,
@@ -1278,8 +1279,20 @@ fn luminance(c: vec3f) -> f32 {
         let mv = textureLoad(motionTex, vec2u(col, row), 0).rg;
         return vec4f(mv * 5.0 + 0.5, 0.5, 1.0);
     }
+    // Mode 6: Star warp. starTex holds LINEAR-light star coverage; encode to
+    // sRGB here (the canvas expects sRGB-encoded values) so a star split
+    // across pixels keeps the same total perceived brightness as a centered one.
+    if (disp.mode == 6u) {
+        let c = srgbEncode(clamp(textureLoad(starTex, vec2u(col, row), 0).r, 0.0, 1.0));
+        return vec4f(c, c, c, 1.0);
+    }
     // Mode 5: Raw noise
     return applyThreshold(noiseToDisplay(col, row));
+}
+
+fn srgbEncode(c: f32) -> f32 {
+    if (c <= 0.0031308) { return 12.92 * c; }
+    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 `;
 
@@ -1599,6 +1612,297 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             noise[base + c] = randn(seed);
         }
     }
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Star Warp: splat density, deficit scans, star update, star render
+//
+// The point-process analog of the noise warp: N stars advect along the motion
+// field; deaths thin pile-ups (density > 1) back to uniform, births fill the
+// deficit (density < 1), so every frozen frame is a uniform random star field.
+// Density is measured by forward-splatting uniform mass along the flow — NOT
+// the flow Jacobian, which is blind to translations (uncovered edge strips)
+// and fold-overs (det == 1 pile-ups). See web_demo_v3/claude_instructions.md.
+//
+// Conventions: star domain is [0, W] x [0, H] (cell-area, pixel (r,c) covers
+// [c, c+1] x [r, r+1], center at +0.5). Forward pixel flow at a point is
+// (+motion.r * W, -motion.g * H) — NDC y is up, rows go down.
+// ---------------------------------------------------------------------------
+
+// Shared WGSL for the star compute passes (uniforms, PRNG, bilinear helpers).
+const starCommonWGSL = /* wgsl */`
+struct StarUniforms {
+    W:         u32,
+    H:         u32,
+    frameSeed: u32,
+    numStars:  u32,
+}
+
+fn pcg(v: u32) -> u32 {
+    var state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn rand01(state: ptr<function, u32>) -> f32 {
+    *state = pcg(*state);
+    return f32(*state) / 4294967296.0;
+}
+`;
+
+export const starSplatWGSL = /* wgsl */`
+${starCommonWGSL}
+
+@group(0) @binding(0) var<uniform> u: StarUniforms;
+@group(0) @binding(1) var motionTex: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read_write> density: array<atomic<u32>>;
+
+fn atomicAddF32(addr: ptr<storage, atomic<u32>, read_write>, val: f32) {
+    var old = atomicLoad(addr);
+    loop {
+        let newVal = bitcast<u32>(bitcast<f32>(old) + val);
+        let result = atomicCompareExchangeWeak(addr, old, newVal);
+        if (result.exchanged) { break; }
+        old = result.old_value;
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= u.W * u.H) { return; }
+    let row = idx / u.W;
+    let col = idx % u.W;
+
+    let m = textureLoad(motionTex, vec2u(col, row), 0);
+    let fx = m.r * f32(u.W);
+    let fy = -m.g * f32(u.H);
+
+    // Pixel center (col+0.5, row+0.5) lands at center + flow; splat position in
+    // texel-index space is that minus 0.5.
+    let px = f32(col) + fx;
+    let py = f32(row) + fy;
+    let x0 = i32(floor(px));
+    let y0 = i32(floor(py));
+    let fxw = px - f32(x0);
+    let fyw = py - f32(y0);
+
+    for (var c: u32 = 0u; c < 4u; c++) {
+        let dx = i32(c & 1u);
+        let dy = i32(c >> 1u);
+        let x = x0 + dx;
+        let y = y0 + dy;
+        let w = select(1.0 - fxw, fxw, dx == 1) * select(1.0 - fyw, fyw, dy == 1);
+        if (x >= 0 && x < i32(u.W) && y >= 0 && y < i32(u.H) && w > 0.0) {
+            atomicAddF32(&density[u32(y) * u.W + u32(x)], w);
+        }
+    }
+}
+`;
+
+// Per-row inclusive prefix sums of the deficit max(1 - E, 0).
+// Last column of each row is that row's total deficit.
+export const starScanRowsWGSL = /* wgsl */`
+${starCommonWGSL}
+
+@group(0) @binding(0) var<uniform> u: StarUniforms;
+@group(0) @binding(1) var<storage, read>       density:   array<f32>;
+@group(0) @binding(2) var<storage, read_write> rowPrefix: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let row = gid.x;
+    if (row >= u.H) { return; }
+    var acc: f32 = 0.0;
+    for (var col: u32 = 0u; col < u.W; col++) {
+        acc += max(1.0 - density[row * u.W + col], 0.0);
+        rowPrefix[row * u.W + col] = acc;
+    }
+}
+`;
+
+// Inclusive prefix over row totals -> row CDF. Last entry = grand total deficit.
+// Single thread: H is at most a few thousand; this pass is microseconds.
+export const starScanCdfWGSL = /* wgsl */`
+${starCommonWGSL}
+
+@group(0) @binding(0) var<uniform> u: StarUniforms;
+@group(0) @binding(1) var<storage, read>       rowPrefix: array<f32>;
+@group(0) @binding(2) var<storage, read_write> rowCdf:    array<f32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    var acc: f32 = 0.0;
+    for (var row: u32 = 0u; row < u.H; row++) {
+        acc += rowPrefix[row * u.W + u.W - 1u];
+        rowCdf[row] = acc;
+    }
+}
+`;
+
+// Per-star: advect along the flow, die out-of-frame or in pile-ups
+// (survive w.p. 1/max(E,1) at the NEW position), respawn from the deficit CDF.
+export const starUpdateWGSL = /* wgsl */`
+${starCommonWGSL}
+
+@group(0) @binding(0) var<uniform> u: StarUniforms;
+@group(0) @binding(1) var motionTex: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read>       density:   array<f32>;
+@group(0) @binding(3) var<storage, read>       rowPrefix: array<f32>;
+@group(0) @binding(4) var<storage, read>       rowCdf:    array<f32>;
+@group(0) @binding(5) var<storage, read_write> stars:     array<f32>;
+
+// Bilinear sample of the motion texture at continuous pixel position p,
+// border-clamped in texel-index space.
+fn sampleMotion(p: vec2f) -> vec2f {
+    let maxIdx = vec2f(f32(u.W) - 1.0, f32(u.H) - 1.0);
+    let q = clamp(p - 0.5, vec2f(0.0), maxIdx);
+    let q0 = clamp(floor(q), vec2f(0.0), maxIdx - vec2f(1.0));
+    let f = clamp(q - q0, vec2f(0.0), vec2f(1.0));
+    let x0 = u32(q0.x); let y0 = u32(q0.y);
+    let m00 = textureLoad(motionTex, vec2u(x0,      y0     ), 0).rg;
+    let m10 = textureLoad(motionTex, vec2u(x0 + 1u, y0     ), 0).rg;
+    let m01 = textureLoad(motionTex, vec2u(x0,      y0 + 1u), 0).rg;
+    let m11 = textureLoad(motionTex, vec2u(x0 + 1u, y0 + 1u), 0).rg;
+    return mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y);
+}
+
+// Bilinear sample of the density buffer at continuous pixel position p.
+fn sampleDensity(p: vec2f) -> f32 {
+    let maxIdx = vec2f(f32(u.W) - 1.0, f32(u.H) - 1.0);
+    let q = clamp(p - 0.5, vec2f(0.0), maxIdx);
+    let q0 = clamp(floor(q), vec2f(0.0), maxIdx - vec2f(1.0));
+    let f = clamp(q - q0, vec2f(0.0), vec2f(1.0));
+    let x0 = u32(q0.x); let y0 = u32(q0.y);
+    let d00 = density[y0 * u.W + x0];
+    let d10 = density[y0 * u.W + x0 + 1u];
+    let d01 = density[(y0 + 1u) * u.W + x0];
+    let d11 = density[(y0 + 1u) * u.W + x0 + 1u];
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+// Smallest index in [0, n) whose inclusive-prefix value exceeds t.
+fn lowerBound(base: u32, n: u32, t: f32, isRowCdf: bool) -> u32 {
+    var lo: u32 = 0u;
+    var hi: u32 = n - 1u;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2u;
+        var v: f32;
+        if (isRowCdf) { v = rowCdf[base + mid]; } else { v = rowPrefix[base + mid]; }
+        if (v > t) { hi = mid; } else { lo = mid + 1u; }
+    }
+    return lo;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= u.numStars) { return; }
+
+    var pos = vec2f(stars[i * 2u], stars[i * 2u + 1u]);
+    var rng: u32 = pcg(u.frameSeed * 104729u + i);
+
+    // Advect: flow sampled at the OLD position.
+    let m = sampleMotion(pos);
+    pos += vec2f(m.x * f32(u.W), -m.y * f32(u.H));
+
+    let domain = vec2f(f32(u.W), f32(u.H));
+    var dead = pos.x < 0.0 || pos.x > domain.x || pos.y < 0.0 || pos.y > domain.y;
+
+    if (!dead) {
+        // Crowding death at the NEW position: thin pile-ups back to uniform.
+        let e = sampleDensity(pos);
+        let survival = 1.0 / max(e, 1.0);
+        if (rand01(&rng) >= survival) { dead = true; }
+    }
+
+    if (dead) {
+        let total = rowCdf[u.H - 1u];
+        if (total <= 1e-6) {
+            // No deficit anywhere: respawn uniformly (the quota must hold).
+            pos = vec2f(rand01(&rng) * domain.x, rand01(&rng) * domain.y);
+        } else {
+            // Two-level inverse-CDF: row from the row CDF, column within the row.
+            let t = rand01(&rng) * total;
+            let row = lowerBound(0u, u.H, t, true);
+            let tIn = t - select(0.0, rowCdf[row - 1u], row > 0u);
+            let col = lowerBound(row * u.W, u.W, tIn, false);
+            // Tent jitter within the cell keeps positions continuous while each
+            // cell receives exactly its share of birth mass; reflect at borders.
+            pos = vec2f(f32(col) + 0.5 + rand01(&rng) - rand01(&rng),
+                        f32(row) + 0.5 + rand01(&rng) - rand01(&rng));
+            pos = abs(pos);
+            pos = domain - abs(domain - pos);
+        }
+    }
+
+    stars[i * 2u]      = pos.x;
+    stars[i * 2u + 1u] = pos.y;
+}
+`;
+
+// Star render: one quad per star into starTex (rgba16float, additive blend).
+// AA: tent-kernel coverage in LINEAR light — the unit tent is a partition of
+// unity, so total luminance per star is exactly invariant under subpixel
+// position (integer radius). The display pass applies the sRGB OETF last.
+// AA off: hard weight-1 quads (0/1 are sRGB fixed points, same display path).
+export const starRenderWGSL = /* wgsl */`
+struct StarRenderUniforms {
+    W:        u32,
+    H:        u32,
+    numStars: u32,
+    aa:       u32,
+    radius:   f32,   // tent radius in texels (integer-valued for exactness)
+    hardHalf: f32,   // half-extent of the hard (non-AA) quad in texels
+}
+
+@group(0) @binding(0) var<uniform> u: StarRenderUniforms;
+@group(0) @binding(1) var<storage, read> stars: array<f32>;
+
+struct VsOut {
+    @builtin(position) position: vec4f,
+    @location(0) @interpolate(flat) starPos: vec2f,
+}
+
+@vertex fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
+    let star = vid / 6u;
+    let corner = vid % 6u;
+    var out: VsOut;
+    if (star >= u.numStars) {
+        out.position = vec4f(2.0, 2.0, 0.0, 1.0);  // degenerate, off-screen
+        out.starPos = vec2f(0.0);
+        return out;
+    }
+    let pos = vec2f(stars[star * 2u], stars[star * 2u + 1u]);
+
+    // Quad half-extent: cover the full tent support (+0.5 so every texel whose
+    // center lies within the tent gets a fragment).
+    let half = select(u.hardHalf, u.radius + 0.5, u.aa == 1u);
+    // Triangle-list corners: (-1,-1) (1,-1) (-1,1) / (1,-1) (1,1) (-1,1)
+    var offsets = array<vec2f, 6>(
+        vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+        vec2f( 1.0, -1.0), vec2f(1.0,  1.0), vec2f(-1.0, 1.0),
+    );
+    let corner_px = pos + offsets[corner] * half;
+
+    // Pixel coords -> NDC (row 0 is the top => NDC y = +1).
+    let ndc = vec2f(corner_px.x / f32(u.W) * 2.0 - 1.0,
+                    1.0 - corner_px.y / f32(u.H) * 2.0);
+    out.position = vec4f(ndc, 0.0, 1.0);
+    out.starPos = pos;
+    return out;
+}
+
+@fragment fn fs(in: VsOut) -> @location(0) vec4f {
+    var w: f32 = 1.0;
+    if (u.aa == 1u) {
+        // in.position.xy is the fragment's pixel-center coordinate — the same
+        // space the star position lives in, so the tent needs no offsets.
+        let d = abs(in.position.xy - in.starPos);
+        w = max(0.0, 1.0 - d.x / u.radius) * max(0.0, 1.0 - d.y / u.radius);
+    }
+    return vec4f(w, w, w, 1.0);
 }
 `;
 
