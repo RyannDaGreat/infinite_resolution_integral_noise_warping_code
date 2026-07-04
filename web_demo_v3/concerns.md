@@ -102,3 +102,16 @@
   in Stars mode no backup is taken that frame, so the unconditional restore would
   have copied a STALE backup over noiseBuf (same bug class as the lock-restore
   bug from Session 2 — restore paths must be gated by every warp-skipping mode).
+
+### GitHub Pages deploy (same day)
+- Site appeared stale after pushing Stars mode: the Pages build had been BROKEN
+  since Mar 8 — commit 55547ca ("hhhhh") committed web_demo_fluid/node_modules
+  as a symlink to ../web_demo/node_modules (not in the repo tree → dangling).
+  Legacy Jekyll Pages refuses symlinks: every build since errored ("Page build
+  failed"), leaving the live site frozen at the Mar 5 build.
+- Fix: git rm the symlink, .gitignore node_modules (369b5bd). Build went green.
+- Live validation (headless WebGPU against the deployed URL): noise mean 0.0004
+  / std 0.9999; stars 100% in-bounds, min/mean 0.918, max/mean 1.067 under
+  motion. PASS.
+- Lesson: never commit node_modules symlinks — legacy Pages/Jekyll dies on them
+  and the failure is silent unless you check the Pages build API/settings.
