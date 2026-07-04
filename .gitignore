@@ -176,3 +176,4 @@ game_demo/blue_noise_comparison.png
 .claude/worktrees/
 .claude_todo.md
 .claude_logs/
+node_modules
