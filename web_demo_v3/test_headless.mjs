@@ -41,6 +41,13 @@ async function main() {
             const text = msg.text();
             logs.push(text);
             if (msg.type() === 'error') errors.push(text);
+            // Dawn/WebGPU validation failures surface as console WARNINGS in
+            // headless Chrome — missing them once shipped an invalid pipeline
+            // (10 storage buffers > the default per-stage limit of 8).
+            if (msg.type() === 'warning' &&
+                /invalid|error while|exceeds the maximum|validating/i.test(text)) {
+                errors.push(text);
+            }
         });
         page.on('pageerror', err => errors.push(err.message));
 

@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 5;
+const SETTINGS_VERSION = 6;
 
 /**
  * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
@@ -50,6 +50,8 @@ const DEFAULTS = {
     starCount: 50,      // log slider → 10^4 stars (see starCountFromSlider)
     starAA: true,       // antialiased stars (linear-light tent, constant brightness)
     starField: 0,       // background under stars: 0 off, 1 density E, 2 deficit (turbo)
+    starEmoji: false,   // emoji identity sprites instead of white tents
+    starGraveyard: true,// resurrect identities from the ghost ring (5×N)
 };
 
 function loadSettings() {
@@ -95,6 +97,8 @@ export class UIManager {
         this.starCountLabel = document.getElementById('starCountLabel');
         this.starAABtn = document.getElementById('starAABtn');
         this.starFieldBtn = document.getElementById('starFieldBtn');
+        this.starEmojiBtn = document.getElementById('starEmojiBtn');
+        this.starGraveyardBtn = document.getElementById('starGraveyardBtn');
         this.resetSceneBtn = document.getElementById('resetSceneBtn');
         this.slowMoBtn = document.getElementById('slowMoBtn');
         this.timeMiddayBtn = document.getElementById('timeMidday');
@@ -170,6 +174,10 @@ export class UIManager {
         this.starAABtn.classList.toggle('on', s.starAA);
         this.starFieldBtn.textContent = `field: ${['OFF', 'E', 'deficit'][s.starField]}`;
         this.starFieldBtn.classList.toggle('on', s.starField !== 0);
+        this.starEmojiBtn.textContent = `emoji: ${s.starEmoji ? 'ON' : 'OFF'}`;
+        this.starEmojiBtn.classList.toggle('on', s.starEmoji);
+        this.starGraveyardBtn.textContent = `graveyard: ${s.starGraveyard ? 'ON' : 'OFF'}`;
+        this.starGraveyardBtn.classList.toggle('on', s.starGraveyard);
         // Sync mode bar
         for (const btn of this.modeBtns) {
             btn.classList.toggle('on', parseInt(btn.dataset.mode) === this.displayMode);
@@ -198,6 +206,8 @@ export class UIManager {
         renderer.numStars = starCountFromSlider(s.starCount);
         renderer.starAAEnabled = s.starAA;
         renderer.starFieldView = s.starField;
+        renderer.starEmojiEnabled = s.starEmoji;
+        renderer.graveyardEnabled = s.starGraveyard;
     }
 
     /**
@@ -263,6 +273,10 @@ export class UIManager {
         this.starAABtn.addEventListener('click', () => { s.starAA = !s.starAA; update(); });
         this.starFieldBtn.addEventListener('click', () => {
             s.starField = (s.starField + 1) % 3; update();
+        });
+        this.starEmojiBtn.addEventListener('click', () => { s.starEmoji = !s.starEmoji; update(); });
+        this.starGraveyardBtn.addEventListener('click', () => {
+            s.starGraveyard = !s.starGraveyard; update();
         });
         this.shadowsBtn.addEventListener('click', () => { s.shadows = !s.shadows; update(); });
         this.pointLightsBtn.addEventListener('click', () => { s.pointLights = !s.pointLights; update(); });

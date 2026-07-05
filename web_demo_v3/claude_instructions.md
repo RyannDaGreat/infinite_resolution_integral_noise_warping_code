@@ -231,6 +231,47 @@ Tent radius = max(1, round(W/1024)) texels, integer to keep the exactness. AA OF
 draws hard weight-1 quads (retro single-pixel look); 0/1 are sRGB fixed points so
 both paths share one display shader.
 
+- **Star ids + graveyard + emoji view (added 2026-07-05, ported from the Python
+  reference tested in the outer StarWarp repo)**:
+  - **Ids**: starMetaBuf interleaves {q: f32, id: u32} per star (ids seeded
+    0..MAX_STARS−1); fresh births mint ids from starCountersBuf[0] (atomic, starts at
+    MAX_STARS). Resurrection keeps the ghost's id. WHY interleaved: starUpdate must
+    stay at EXACTLY 8 storage buffers (density, rowPrefix, rowCdf, stars, starMeta,
+    counters, ghosts, ghostCellHead) — the BASELINE maxStorageBuffersPerShaderStage
+    is 8, and exceeding it invalidates the pipeline, which invalidates every command
+    buffer touching it → total black screen (shipped once; caught by the user's
+    console). We also request the adapter's own limit at requestDevice, but the
+    8-buffer layout is what guarantees baseline hardware works. counters[1] is the
+    ghost death sequence (reset on graveyard clear; the id mint is NOT reset).
+    WGSL trap: `meta` is a RESERVED KEYWORD — the binding is named starMeta.
+  - **Graveyard** (toggle, default ON, setting `starGraveyard`): ring buffer of
+    GHOST_CAP = 2^20 Ghost structs {x, y, id, cursor:atomic}; effective capacity
+    min(5·N, GHOST_CAP) via ring slot = seq % ghostCap (uniform). cursor = seq+1;
+    0 = empty/claimed tombstone. Per frame (before starUpdate):
+    clearBuffer(ghostCellHeadBuf) → **ghostAdvect** pass (GHOST_CAP threads): advect
+    live ghosts by the motion field, tombstone out-of-bounds, atomicMax(cellHead[cell],
+    cursor) — the per-cell max cursor IS the most-recently-dead ghost (MRU selection
+    for free). starUpdate deaths append ghosts (atomicAdd seq, write slot); births
+    read cellHead[birth cell], claim via CAS(cursor, head, 0) → resurrect at ghost
+    position with ghost id + fresh strength; CAS failure or empty cell → fresh tent
+    birth. KNOWN DEVIATIONS from the Python reference (all benign, documented after
+    testing): (1) at most one resurrection per cell per frame (head holds only the
+    newest ghost; Python popped several) — fallback is a fresh birth so uniformity
+    is untouched; (2) no same-frame resurrection (this frame's deaths aren't in
+    cellHead) — nearly impossible in Python anyway since a death cell has E>1 hence
+    deficit 0; (3) seq is u32 → ring scrambles once after ~4·10⁹ deaths, self-heals.
+    Graveyard cleared (ghostBuf zeroed, seq reset) on init, N change, or toggle.
+  - **Emoji identity view** (toggle, default OFF, setting `starEmoji`): 61-emoji
+    atlas rasterized at init into an 8×8 × 64px OffscreenCanvas →
+    copyExternalImageToTexture (rgba8unorm). starRender gains ids/atlas/sampler
+    bindings and an emoji uniform: vertex picks the atlas cell by Knuth hash
+    (id·2654435761 mod 61), fragment textureSamples premultiplied. Two pipelines
+    share the shader: additive (one/one, white tent mode) vs premultiplied alpha
+    (one/one−srcα, emoji mode), each with its own bind group ('auto' layouts).
+    White mode now writes alpha = coverage so the display composites stars OVER the
+    field background correctly: rgb_out = bg·(1−α) + star_rgb (linear, then sRGB).
+  - StarUniforms grew to 32 B: {W, H, frameSeed, numStars, ghostCap, flags(bit0 =
+    graveyard), pad, pad}. SETTINGS_VERSION 6.
 - **Field background (added 2026-07-05)**: `field: OFF / E / deficit` button in the
   Stars settings row — the display shader composites a dimmed (0.35×) turbo colormap
   of the star density buffer UNDER the stars (linear light, then one sRGB encode).

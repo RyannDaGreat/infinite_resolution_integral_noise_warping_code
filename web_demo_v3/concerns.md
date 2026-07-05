@@ -146,3 +146,28 @@
   click-through OFF->E->deficit->OFF renders with zero console errors; screenshot
   with E field shows uniform mid-turbo green under a static camera (E == 1
   everywhere) as expected.
+
+## 2026-07-05: Emoji identity view + graveyard PORTED to WGSL (with two shipped bugs)
+
+- Port implemented per manifest spec: starMetaBuf {q, id}, starCountersBuf
+  [id mint, ghost seq], ghostBuf ring (GHOST_CAP 2^20, capacity uniform min(5N, cap)),
+  ghostCellHeadBuf + ghostAdvect pass (atomicMax cursor = free MRU), resurrection via
+  CAS claim in starUpdate; emoji atlas (61 glyphs, OffscreenCanvas -> rgba8unorm,
+  Knuth hash by id) + premultiplied-alpha render pipeline variant; white tents now
+  write alpha = coverage so stars composite over the field background.
+- BUG 1 (user-caught, black screen): starUpdate initially bound 10 storage buffers;
+  the DEFAULT maxStorageBuffersPerShaderStage is 8 -> invalid pipeline -> every
+  command buffer containing it rejected at submit -> nothing rendered at all, and
+  the stats staging buffer read back zeros (all "stars" at origin: min/mean 0,
+  max/mean 16 = one meter cell). Fix: consolidate strengths+ids -> starMetaBuf and
+  idCounter+ghostSeq -> starCountersBuf (exactly 8), plus request the adapter's
+  maxStorageBuffersPerShaderStage as belt-and-braces.
+- BUG 2: `meta` is a WGSL RESERVED keyword -> shader module failed to parse.
+  Renamed starMeta.
+- TESTING LESSON (why our headless tests missed both): Dawn/WebGPU validation
+  errors surface as console type WARNING in headless Chrome, not 'error'.
+  test_headless.mjs now promotes warnings matching
+  /invalid|error while|exceeds the maximum|validating/i to failures.
+- Verified after fix: headless + motion tests pass (10k: 0.902/1.051; motion
+  0.936/1.102; 1M @ 60 fps: 0.972/1.041); full toggle sweep (emoji x graveyard x
+  field) zero GPU/JS issues; emoji screenshot confirmed (10k distinct glyphs).

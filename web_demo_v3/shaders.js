@@ -1299,7 +1299,12 @@ fn luminance(c: vec3f) -> f32 {
     // stars stay readable): density E (0 -> blue, 1 -> mid, >=2 -> red) or the
     // deficit max(1 - E, 0), composited in linear light before the sRGB encode.
     if (disp.mode == 6u) {
-        let c = clamp(textureLoad(starTex, vec2u(col, row), 0).r, 0.0, 1.0);
+        // starTex carries premultiplied star color in rgb and coverage in alpha
+        // (white tents: rgb == alpha; emoji sprites: atlas colors), so stars
+        // composite OVER the optional field background in linear light.
+        let s = textureLoad(starTex, vec2u(col, row), 0);
+        let a = clamp(s.a, 0.0, 1.0);
+        let star = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
         var bg = vec3f(0.0);
         const BG_DIM = 0.35;   // background luminance cap: keeps stars readable
         if (disp.starField != 0u) {
@@ -1309,7 +1314,7 @@ fn luminance(c: vec3f) -> f32 {
                            disp.starField == 1u);
             bg = clamp(turbo(t), vec3f(0.0), vec3f(1.0)) * BG_DIM;
         }
-        let rgb = bg * (1.0 - c) + vec3f(c);           // stars over field, linear light
+        let rgb = bg * (1.0 - a) + star;               // stars over field, linear light
         return vec4f(srgbEncode(rgb.r), srgbEncode(rgb.g), srgbEncode(rgb.b), 1.0);
     }
     // Mode 5: Raw noise
@@ -1664,6 +1669,27 @@ struct StarUniforms {
     H:         u32,
     frameSeed: u32,
     numStars:  u32,
+    ghostCap:  u32,   // graveyard ring capacity = min(5 * numStars, GHOST_CAP)
+    flags:     u32,   // bit 0: graveyard enabled
+    _pad0:     u32,
+    _pad1:     u32,
+}
+
+// Per-star metadata: strength q (eroded by crowding, dies at 1) + identity.
+// Interleaved in ONE buffer to stay under maxStorageBuffersPerShaderStage (8):
+// starUpdate binds exactly 8 storage buffers — the default per-stage limit.
+struct StarMeta {
+    q:  f32,
+    id: u32,
+}
+
+// Graveyard slot: a dead star that keeps advecting until evicted or resurrected.
+// cursor = death sequence number + 1; 0 = empty / claimed / evicted tombstone.
+struct Ghost {
+    x:      f32,
+    y:      f32,
+    id:     u32,
+    cursor: atomic<u32>,
 }
 
 fn pcg(v: u32) -> u32 {
@@ -1768,6 +1794,60 @@ fn main() {
 }
 `;
 
+// Graveyard ghost advection: ghosts ride the same motion field as live stars.
+// Out-of-bounds ghosts are tombstoned (their layer left the frame). Each live
+// ghost atomicMax-es its cursor into its pixel cell of ghostCellHead — the max
+// cursor per cell is by construction the MOST RECENTLY DEAD ghost there, which
+// is exactly the MRU resurrection candidate starUpdate wants. ghostCellHead is
+// cleared (all zero = no ghost) before this pass runs each frame.
+export const ghostAdvectWGSL = /* wgsl */`
+${starCommonWGSL}
+
+@group(0) @binding(0) var<uniform> u: StarUniforms;
+@group(0) @binding(1) var motionTex: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read_write> ghosts:        array<Ghost>;
+@group(0) @binding(3) var<storage, read_write> ghostCellHead: array<atomic<u32>>;
+
+// Bilinear sample of the motion texture at continuous pixel position p (same
+// convention as starUpdate's copy — each pass declares its own bindings).
+fn sampleMotion(p: vec2f) -> vec2f {
+    let maxIdx = vec2f(f32(u.W) - 1.0, f32(u.H) - 1.0);
+    let q = clamp(p - 0.5, vec2f(0.0), maxIdx);
+    let q0 = clamp(floor(q), vec2f(0.0), maxIdx - vec2f(1.0));
+    let f = clamp(q - q0, vec2f(0.0), vec2f(1.0));
+    let x0 = u32(q0.x); let y0 = u32(q0.y);
+    let m00 = textureLoad(motionTex, vec2u(x0,      y0     ), 0).rg;
+    let m10 = textureLoad(motionTex, vec2u(x0 + 1u, y0     ), 0).rg;
+    let m01 = textureLoad(motionTex, vec2u(x0,      y0 + 1u), 0).rg;
+    let m11 = textureLoad(motionTex, vec2u(x0 + 1u, y0 + 1u), 0).rg;
+    return mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= u.ghostCap || (u.flags & 1u) == 0u) { return; }
+    let cur = atomicLoad(&ghosts[i].cursor);
+    if (cur == 0u) { return; }
+
+    var p = vec2f(ghosts[i].x, ghosts[i].y);
+    let m = sampleMotion(p);
+    p += vec2f(m.x * f32(u.W), -m.y * f32(u.H));
+
+    let domain = vec2f(f32(u.W), f32(u.H));
+    if (p.x < 0.0 || p.x > domain.x || p.y < 0.0 || p.y > domain.y) {
+        atomicStore(&ghosts[i].cursor, 0u);   // evict: its flow is undefined off-grid
+        return;
+    }
+    ghosts[i].x = p.x;
+    ghosts[i].y = p.y;
+
+    let col = min(u32(max(p.x, 0.0)), u.W - 1u);
+    let row = min(u32(max(p.y, 0.0)), u.H - 1u);
+    atomicMax(&ghostCellHead[row * u.W + col], cur);
+}
+`;
+
 // Per-star: advect along the flow, die out-of-frame or by strength exhaustion —
 // each star's strength q (U[0,1) at birth) is multiplied by max(E,1) at the NEW
 // position and the star dies at q >= 1. Deterministic, RNG-free death: exactly
@@ -1785,7 +1865,11 @@ ${starCommonWGSL}
 @group(0) @binding(3) var<storage, read>       rowPrefix: array<f32>;
 @group(0) @binding(4) var<storage, read>       rowCdf:    array<f32>;
 @group(0) @binding(5) var<storage, read_write> stars:     array<f32>;
-@group(0) @binding(6) var<storage, read_write> strengths: array<f32>;
+@group(0) @binding(6) var<storage, read_write> starMeta:  array<StarMeta>;
+// counters[0] = fresh-birth id mint, counters[1] = ghost death sequence
+@group(0) @binding(7) var<storage, read_write> counters:  array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read_write> ghosts:    array<Ghost>;
+@group(0) @binding(9) var<storage, read>       ghostCellHead: array<u32>; // built by ghostAdvect
 
 // Bilinear sample of the motion texture at continuous pixel position p,
 // border-clamped in texel-index space.
@@ -1835,15 +1919,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (i >= u.numStars) { return; }
 
     var pos = vec2f(stars[i * 2u], stars[i * 2u + 1u]);
-    var q = strengths[i];
+    var q = starMeta[i].q;
+    var id = starMeta[i].id;
     var rng: u32 = pcg(u.frameSeed * 104729u + i);  // births only; death is RNG-free
+    let graveyard = (u.flags & 1u) != 0u;
 
     // Advect: flow sampled at the OLD position.
     let m = sampleMotion(pos);
     pos += vec2f(m.x * f32(u.W), -m.y * f32(u.H));
 
     let domain = vec2f(f32(u.W), f32(u.H));
-    var dead = pos.x < 0.0 || pos.x > domain.x || pos.y < 0.0 || pos.y > domain.y;
+    let oob = pos.x < 0.0 || pos.x > domain.x || pos.y < 0.0 || pos.y > domain.y;
+    var dead = oob;
 
     if (!dead) {
         // Crowding at the NEW position erodes the star's strength; die at 1.
@@ -1854,29 +1941,63 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     if (dead) {
+        // In-bounds dead stars join the graveyard: write the ghost, then
+        // publish it by storing cursor = seq + 1 (0 stays the empty sentinel).
+        // The ring overwrites the oldest ghost automatically (age eviction).
+        if (graveyard && !oob) {
+            let seq = atomicAdd(&counters[1], 1u);
+            let slot = seq % u.ghostCap;
+            ghosts[slot].x = pos.x;
+            ghosts[slot].y = pos.y;
+            ghosts[slot].id = id;
+            atomicStore(&ghosts[slot].cursor, seq + 1u);
+        }
+
         q = rand01(&rng);  // fresh strength at birth
         let total = rowCdf[u.H - 1u];
         if (total <= 1e-6) {
             // No deficit anywhere: respawn uniformly (the quota must hold).
             pos = vec2f(rand01(&rng) * domain.x, rand01(&rng) * domain.y);
+            id = atomicAdd(&counters[0], 1u);
         } else {
             // Two-level inverse-CDF: row from the row CDF, column within the row.
             let t = rand01(&rng) * total;
             let row = lowerBound(0u, u.H, t, true);
             let tIn = t - select(0.0, rowCdf[row - 1u], row > 0u);
             let col = lowerBound(row * u.W, u.W, tIn, false);
-            // Tent jitter within the cell keeps positions continuous while each
-            // cell receives exactly its share of birth mass; reflect at borders.
-            pos = vec2f(f32(col) + 0.5 + rand01(&rng) - rand01(&rng),
-                        f32(row) + 0.5 + rand01(&rng) - rand01(&rng));
-            pos = abs(pos);
-            pos = domain - abs(domain - pos);
+
+            // Resurrection: if the most-recently-dead ghost in this birth cell
+            // is still unclaimed, take its position and identity (the birth
+            // CELL distribution is untouched, so uniformity is preserved —
+            // see the outer StarWarp manifest for the measured proof).
+            var resurrected = false;
+            if (graveyard) {
+                let head = ghostCellHead[row * u.W + col];
+                if (head != 0u) {
+                    let slot = (head - 1u) % u.ghostCap;
+                    let claim = atomicCompareExchangeWeak(&ghosts[slot].cursor, head, 0u);
+                    if (claim.exchanged) {
+                        pos = vec2f(ghosts[slot].x, ghosts[slot].y);
+                        id = ghosts[slot].id;
+                        resurrected = true;
+                    }
+                }
+            }
+            if (!resurrected) {
+                // Tent jitter within the cell keeps positions continuous while each
+                // cell receives exactly its share of birth mass; reflect at borders.
+                pos = vec2f(f32(col) + 0.5 + rand01(&rng) - rand01(&rng),
+                            f32(row) + 0.5 + rand01(&rng) - rand01(&rng));
+                pos = abs(pos);
+                pos = domain - abs(domain - pos);
+                id = atomicAdd(&counters[0], 1u);
+            }
         }
     }
 
     stars[i * 2u]      = pos.x;
     stars[i * 2u + 1u] = pos.y;
-    strengths[i]       = q;
+    starMeta[i]        = StarMeta(q, id);
 }
 `;
 
@@ -1887,20 +2008,34 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 // AA off: hard weight-1 quads (0/1 are sRGB fixed points, same display path).
 export const starRenderWGSL = /* wgsl */`
 struct StarRenderUniforms {
-    W:        u32,
-    H:        u32,
-    numStars: u32,
-    aa:       u32,
-    radius:   f32,   // tent radius in texels (integer-valued for exactness)
-    hardHalf: f32,   // half-extent of the hard (non-AA) quad in texels
+    W:         u32,
+    H:         u32,
+    numStars:  u32,
+    aa:        u32,
+    radius:    f32,   // tent radius in texels (integer-valued for exactness)
+    hardHalf:  f32,   // half-extent of the hard (non-AA) quad in texels
+    emoji:     u32,   // 1: render id-hashed emoji sprites instead of tents
+    glyphHalf: f32,   // half-extent of an emoji sprite in texels
+}
+
+struct StarMeta {
+    q:  f32,
+    id: u32,
 }
 
 @group(0) @binding(0) var<uniform> u: StarRenderUniforms;
 @group(0) @binding(1) var<storage, read> stars: array<f32>;
+@group(0) @binding(2) var<storage, read> starMeta: array<StarMeta>;
+@group(0) @binding(3) var atlasTex: texture_2d<f32>;
+@group(0) @binding(4) var atlasSamp: sampler;
+
+const ATLAS_GRID = 8u;      // 8x8 glyph cells in the atlas
+const ATLAS_GLYPHS = 61u;   // populated cells (rest are empty)
 
 struct VsOut {
     @builtin(position) position: vec4f,
     @location(0) @interpolate(flat) starPos: vec2f,
+    @location(1) uv: vec2f,
 }
 
 @vertex fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
@@ -1910,19 +2045,27 @@ struct VsOut {
     if (star >= u.numStars) {
         out.position = vec4f(2.0, 2.0, 0.0, 1.0);  // degenerate, off-screen
         out.starPos = vec2f(0.0);
+        out.uv = vec2f(0.0);
         return out;
     }
     let pos = vec2f(stars[star * 2u], stars[star * 2u + 1u]);
 
     // Quad half-extent: cover the full tent support (+0.5 so every texel whose
-    // center lies within the tent gets a fragment).
-    let half = select(u.hardHalf, u.radius + 0.5, u.aa == 1u);
+    // center lies within the tent gets a fragment); emoji sprites use their own.
+    var half = select(u.hardHalf, u.radius + 0.5, u.aa == 1u);
+    if (u.emoji == 1u) { half = u.glyphHalf; }
     // Triangle-list corners: (-1,-1) (1,-1) (-1,1) / (1,-1) (1,1) (-1,1)
     var offsets = array<vec2f, 6>(
         vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
         vec2f( 1.0, -1.0), vec2f(1.0,  1.0), vec2f(-1.0, 1.0),
     );
     let corner_px = pos + offsets[corner] * half;
+
+    // Same identity -> same glyph, always: Knuth multiplicative hash -> atlas cell.
+    // Atlas rows and quad pixel rows both run top-down, so uv aligns directly.
+    let g = (starMeta[star].id * 2654435761u) % ATLAS_GLYPHS;
+    let cell = vec2f(f32(g % ATLAS_GRID), f32(g / ATLAS_GRID));
+    out.uv = (cell + offsets[corner] * 0.5 + vec2f(0.5)) / f32(ATLAS_GRID);
 
     // Pixel coords -> NDC (row 0 is the top => NDC y = +1).
     let ndc = vec2f(corner_px.x / f32(u.W) * 2.0 - 1.0,
@@ -1933,6 +2076,11 @@ struct VsOut {
 }
 
 @fragment fn fs(in: VsOut) -> @location(0) vec4f {
+    if (u.emoji == 1u) {
+        // Premultiplied sprite; pipeline blends one / one-minus-src-alpha.
+        let s = textureSample(atlasTex, atlasSamp, in.uv);
+        return vec4f(s.rgb * s.a, s.a);
+    }
     var w: f32 = 1.0;
     if (u.aa == 1u) {
         // in.position.xy is the fragment's pixel-center coordinate — the same
@@ -1940,7 +2088,9 @@ struct VsOut {
         let d = abs(in.position.xy - in.starPos);
         w = max(0.0, 1.0 - d.x / u.radius) * max(0.0, 1.0 - d.y / u.radius);
     }
-    return vec4f(w, w, w, 1.0);
+    // Alpha carries coverage so the display can composite stars OVER the
+    // optional field background (additive blend accumulates it like rgb).
+    return vec4f(w, w, w, w);
 }
 `;
 

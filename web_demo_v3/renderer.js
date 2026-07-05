@@ -9,6 +9,7 @@ import {
     buildDeformWGSL, backwardMapWGSL, brownianWGSL, normalizeWGSL,
     blueNoiseBlurWGSL,
     starSplatWGSL, starScanRowsWGSL, starScanCdfWGSL, starUpdateWGSL, starRenderWGSL,
+    ghostAdvectWGSL,
 } from './shaders.js';
 import { MAX_INSTANCES, FLOATS_PER_INSTANCE, TERRAIN_INSTANCE_IDX } from './scene.js';
 
@@ -18,6 +19,18 @@ const NUM_TIMESTAMPS = 12;
 export const STARS_MODE = 6;
 export const MAX_STARS = 1 << 20;      // preallocated star capacity; active N is a uniform
 const STAR_STATS_SAMPLE = 65536;       // positions read back for headless uniformity stats
+const GHOST_CAP = 1 << 20;             // graveyard ring slots (16 B each); capacity uniform = min(5N, this)
+export const GRAVEYARD_MULT = 5;       // ghosts kept per active star (user default; tunable)
+const GHOST_STRIDE_BYTES = 16;         // Ghost struct: x, y, id, cursor
+// Emoji identity atlas: same 61-glyph palette as the report playground; id ->
+// Knuth hash -> cell, so the same identity always renders the same emoji.
+const EMOJIS = ['🍎','🍊','🍋','🍉','🍇','🍓','🍒','🥝','🍍','🥑','🌽','🥕','🍄','🌸','🌻',
+    '🌷','🍀','🌵','🌲','🍁','🐶','🐱','🐭','🐰','🦊','🐻','🐼','🐨','🐯','🦁','🐮','🐷',
+    '🐸','🐵','🐔','🐧','🦆','🦉','🐢','🐍','🐙','🦀','🐠','🐬','🐳','⭐','🌙','⚡','🔥',
+    '💧','🌈','🎈','🎲','🎯','🎸','🚀','🔑','💎','🧲','🪐','🫧','🍩'];
+const ATLAS_GRID = 8;                  // 8x8 cells
+const ATLAS_CELL_PX = 64;              // per-glyph raster size
+const GLYPH_HALF_BASE = 8;             // emoji sprite half-extent in texels at 1024 wide
 
 const BN_INV_SIGMA_TABLE = [
     1.083608, 1.035389, 1.023437, 1.017777, 1.014435,
@@ -177,6 +190,9 @@ export class WebGPURenderer {
         this.numStars = 10000;
         this.starAAEnabled = true;
         this.starFieldView = 0;   // 0 off, 1 density E, 2 deficit — turbo bg under stars
+        this.starEmojiEnabled = false;   // render id-hashed emoji sprites
+        this.graveyardEnabled = true;    // resurrect identities from the ghost ring
+        this._graveyardKey = '';         // clears the graveyard when N/toggle changes
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -196,6 +212,7 @@ export class WebGPURenderer {
             requiredLimits: {
                 maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
                 maxBufferSize: adapter.limits.maxBufferSize,
+                maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
             },
         });
         this.device.lost.then(info => { throw new Error('WebGPU device lost: ' + info.message); });
@@ -220,6 +237,7 @@ export class WebGPURenderer {
         this.depthTex?.destroy();
         this.shadowTex?.destroy();
         this.starTex?.destroy();
+        this.atlasTex?.destroy();
 
         const bufs = [
             this.noiseBuf, this.bufferBuf, this.totalRequestBuf, this.ticketCountBuf,
@@ -230,8 +248,10 @@ export class WebGPURenderer {
             this.bnBackupBuf,
             this.bnBlurHUniformBuf,
             ...(this.bnBlurVUniformBufs || []),
-            this.starBuf, this.starStrengthBuf, this.starDensityBuf, this.starRowPrefixBuf,
+            this.starBuf, this.starMetaBuf, this.starCountersBuf,
+            this.ghostBuf, this.ghostCellHeadBuf,
             this.starRowCdfBuf, this.starUniformBuf, this.starRenderUniformBuf, this._starStagingBuf,
+            this.starDensityBuf, this.starRowPrefixBuf,
             this.boxVB, this.sphereVB, this.quadVB, this.terrainVB,
         ];
         if (this.hasTimestamps) bufs.push(this.querySet, this.tsResolveBuf, this.tsReadBuf);
@@ -267,11 +287,34 @@ export class WebGPURenderer {
             size: [W, H], format: 'rgba16float',
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
+        // Emoji identity atlas: rasterize the palette once via 2D canvas (emoji
+        // fonts come free), upload unpremultiplied; the shader premultiplies.
+        const atlasPx = ATLAS_GRID * ATLAS_CELL_PX;
+        const atlasCanvas = new OffscreenCanvas(atlasPx, atlasPx);
+        const actx = atlasCanvas.getContext('2d');
+        actx.font = `${Math.round(ATLAS_CELL_PX * 0.8)}px sans-serif`;
+        actx.textAlign = 'center';
+        actx.textBaseline = 'middle';
+        EMOJIS.forEach((glyph, g) => {
+            actx.fillText(glyph,
+                (g % ATLAS_GRID + 0.5) * ATLAS_CELL_PX,
+                (Math.floor(g / ATLAS_GRID) + 0.5) * ATLAS_CELL_PX);
+        });
+        this.atlasTex = device.createTexture({
+            size: [atlasPx, atlasPx], format: 'rgba8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+                   GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        device.queue.copyExternalImageToTexture(
+            { source: atlasCanvas }, { texture: this.atlasTex }, [atlasPx, atlasPx]);
+        this.atlasSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
         this.colorTexView  = this.colorTex.createView();
         this.motionTexView = this.motionTex.createView();
         this.depthTexView  = this.depthTex.createView();
         this.shadowTexView = this.shadowTex.createView({ aspect: 'depth-only' });
         this.starTexView   = this.starTex.createView();
+        this.atlasTexView  = this.atlasTex.createView();
     }
 
     _createBuffers() {
@@ -336,15 +379,22 @@ export class WebGPURenderer {
             size: MAX_STARS * 2 * f4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
-        // Star strength q per star: U[0,1) at birth, eroded by crowding in
-        // starUpdate, dies at q >= 1. Separate stride-1 buffer so the render
-        // and stats paths keep reading the stride-2 position buffer untouched.
-        this.starStrengthBuf = storage(MAX_STARS * f4, GPUBufferUsage.COPY_DST);
+        // Star strength q (U[0,1) at birth, eroded by crowding, dies at 1) and
+        // persistent identity per star, kept OUT of the stride-2 position
+        // buffer so the render and stats paths stay untouched.
+        // {q, id} interleaved: ONE buffer, so starUpdate stays at 8 storage
+        // buffers — the baseline maxStorageBuffersPerShaderStage.
+        this.starMetaBuf = storage(MAX_STARS * 2 * f4, GPUBufferUsage.COPY_DST);
+        // counters[0] = fresh-birth id mint, counters[1] = ghost death sequence.
+        this.starCountersBuf = storage(2 * f4, GPUBufferUsage.COPY_DST);
+        // Graveyard: ghost ring + per-cell MRU head grid.
+        this.ghostBuf = storage(GHOST_CAP * GHOST_STRIDE_BYTES, GPUBufferUsage.COPY_DST);
+        this.ghostCellHeadBuf = storage(N * f4, GPUBufferUsage.COPY_DST);
         this.starDensityBuf   = storage(N * f4, GPUBufferUsage.COPY_DST);  // E (CAS-atomic f32)
         this.starRowPrefixBuf = storage(N * f4);       // per-row deficit prefix sums
         this.starRowCdfBuf    = storage(this.H * f4);  // row CDF; last entry = total deficit
         this.starUniformBuf = device.createBuffer({
-            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.starRenderUniformBuf = device.createBuffer({
             size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -496,23 +546,28 @@ export class WebGPURenderer {
         this.starScanRowsPipeline = computePipeline(mod(starScanRowsWGSL));
         this.starScanCdfPipeline = computePipeline(mod(starScanCdfWGSL));
         this.starUpdatePipeline  = computePipeline(mod(starUpdateWGSL));
+        this.ghostAdvectPipeline = computePipeline(mod(ghostAdvectWGSL));
 
         // Star render: additive blending accumulates LINEAR-light tent coverage.
         const starModule = mod(starRenderWGSL);
-        this.starRenderPipeline = device.createRenderPipeline({
+        const starRenderPipelineWithBlend = (blend) => device.createRenderPipeline({
             layout: 'auto',
             vertex: { module: starModule, entryPoint: 'vs' },
             fragment: {
                 module: starModule, entryPoint: 'fs',
-                targets: [{
-                    format: 'rgba16float',
-                    blend: {
-                        color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-                        alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-                    },
-                }],
+                targets: [{ format: 'rgba16float', blend }],
             },
             primitive: { topology: 'triangle-list' },
+        });
+        // White tents accumulate additively (linear-light coverage in rgb AND a);
+        // emoji sprites composite premultiplied-over so overlaps don't blow out.
+        this.starRenderPipeline = starRenderPipelineWithBlend({
+            color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+        });
+        this.starRenderPipelineEmoji = starRenderPipelineWithBlend({
+            color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
         });
     }
 
@@ -603,15 +658,36 @@ export class WebGPURenderer {
                 { binding: 3, resource: buf(this.starRowPrefixBuf) },
                 { binding: 4, resource: buf(this.starRowCdfBuf) },
                 { binding: 5, resource: buf(this.starBuf) },
-                { binding: 6, resource: buf(this.starStrengthBuf) },
+                { binding: 6, resource: buf(this.starMetaBuf) },
+                { binding: 7, resource: buf(this.starCountersBuf) },
+                { binding: 8, resource: buf(this.ghostBuf) },
+                { binding: 9, resource: buf(this.ghostCellHeadBuf) },
             ],
         });
+        this.ghostAdvectBindGroup = device.createBindGroup({
+            layout: this.ghostAdvectPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.starUniformBuf) },
+                { binding: 1, resource: this.motionTexView },
+                { binding: 2, resource: buf(this.ghostBuf) },
+                { binding: 3, resource: buf(this.ghostCellHeadBuf) },
+            ],
+        });
+        // Same entries for both render pipelines ('auto' layouts are per-pipeline).
+        const starRenderEntries = () => [
+            { binding: 0, resource: buf(this.starRenderUniformBuf) },
+            { binding: 1, resource: buf(this.starBuf) },
+            { binding: 2, resource: buf(this.starMetaBuf) },
+            { binding: 3, resource: this.atlasTexView },
+            { binding: 4, resource: this.atlasSampler },
+        ];
         this.starRenderBindGroup = device.createBindGroup({
             layout: this.starRenderPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.starRenderUniformBuf) },
-                { binding: 1, resource: buf(this.starBuf) },
-            ],
+            entries: starRenderEntries(),
+        });
+        this.starRenderBindGroupEmoji = device.createBindGroup({
+            layout: this.starRenderPipelineEmoji.getBindGroupLayout(0),
+            entries: starRenderEntries(),
         });
 
         // Build deformation
@@ -775,14 +851,34 @@ export class WebGPURenderer {
         const { H, W, device } = this;
         const rng = makeRng(777);
         const data = new Float32Array(MAX_STARS * 2);
-        const strengths = new Float32Array(MAX_STARS);
+        const metaBuf = new ArrayBuffer(MAX_STARS * 2 * 4);   // {q: f32, id: u32}
+        const metaF32 = new Float32Array(metaBuf);
+        const metaU32 = new Uint32Array(metaBuf);
         for (let i = 0; i < MAX_STARS; i++) {
-            data[i * 2]     = rng() * W;
-            data[i * 2 + 1] = rng() * H;
-            strengths[i]    = rng();
+            data[i * 2]      = rng() * W;
+            data[i * 2 + 1]  = rng() * H;
+            metaF32[i * 2]   = rng();   // strength q
+            metaU32[i * 2+1] = i;       // identity
         }
         device.queue.writeBuffer(this.starBuf, 0, data);
-        device.queue.writeBuffer(this.starStrengthBuf, 0, strengths);
+        device.queue.writeBuffer(this.starMetaBuf, 0, metaBuf);
+        device.queue.writeBuffer(this.starCountersBuf, 0, new Uint32Array([MAX_STARS, 0]));
+        this._clearGraveyard();
+    }
+
+    /**
+     * Empty the graveyard: zero every ghost slot (cursor 0 = empty) and the
+     * death sequence counter. Needed on init and whenever N or the graveyard
+     * toggle changes (the ring modulo changes, scrambling slot ownership).
+     * Not pure: submits a GPU command buffer.
+     */
+    _clearGraveyard() {
+        const encoder = this.device.createCommandEncoder();
+        encoder.clearBuffer(this.ghostBuf);
+        encoder.clearBuffer(this.ghostCellHeadBuf);
+        this.device.queue.submit([encoder.finish()]);
+        // reset the death sequence (counters[1]); the id mint (counters[0]) keeps counting
+        this.device.queue.writeBuffer(this.starCountersBuf, 4, new Uint32Array([0]));
     }
 
     _updateBlurUniforms() {
@@ -1127,8 +1223,16 @@ export class WebGPURenderer {
 
         // --- Star warp (Stars display mode only) ---
         if (starsMode) {
+            // N or graveyard-toggle changes scramble the ghost ring: start fresh.
+            const graveyardKey = `${numStars}|${this.graveyardEnabled}`;
+            if (graveyardKey !== this._graveyardKey) {
+                this._graveyardKey = graveyardKey;
+                this._clearGraveyard();
+            }
+            const ghostCap = Math.min(GRAVEYARD_MULT * numStars, GHOST_CAP);
+            const starFlags = this.graveyardEnabled ? 1 : 0;
             device.queue.writeBuffer(this.starUniformBuf, 0,
-                new Uint32Array([W, H, frameSeed, numStars]));
+                new Uint32Array([W, H, frameSeed, numStars, ghostCap, starFlags, 0, 0]));
 
             // Render uniform: tent radius (integer for exact partition-of-unity
             // brightness invariance) and hard-quad half-extent both scale with
@@ -1141,11 +1245,24 @@ export class WebGPURenderer {
             srU32[0] = W; srU32[1] = H; srU32[2] = numStars;
             srU32[3] = this.starAAEnabled ? 1 : 0;
             srF32[4] = tentRadius; srF32[5] = hardHalf;
+            srU32[6] = this.starEmojiEnabled ? 1 : 0;
+            srF32[7] = Math.max(6, Math.round(W / 1024 * GLYPH_HALF_BASE));
             device.queue.writeBuffer(this.starRenderUniformBuf, 0, srBuf);
 
             // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
             if (!this.noiseLocked) {
                 encoder.clearBuffer(this.starDensityBuf);
+
+                if (this.graveyardEnabled) {
+                    // Ghosts ride the flow; each publishes itself as its cell's
+                    // MRU resurrection candidate before starUpdate births run.
+                    encoder.clearBuffer(this.ghostCellHeadBuf);
+                    const ghostPass = encoder.beginComputePass();
+                    ghostPass.setPipeline(this.ghostAdvectPipeline);
+                    ghostPass.setBindGroup(0, this.ghostAdvectBindGroup);
+                    ghostPass.dispatchWorkgroups(Math.ceil(ghostCap / 256));
+                    ghostPass.end();
+                }
 
                 const splatPass = encoder.beginComputePass();
                 splatPass.setPipeline(this.starSplatPipeline);
@@ -1179,8 +1296,10 @@ export class WebGPURenderer {
                     loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0],
                 }],
             });
-            starPass.setPipeline(this.starRenderPipeline);
-            starPass.setBindGroup(0, this.starRenderBindGroup);
+            starPass.setPipeline(this.starEmojiEnabled ? this.starRenderPipelineEmoji
+                                                        : this.starRenderPipeline);
+            starPass.setBindGroup(0, this.starEmojiEnabled ? this.starRenderBindGroupEmoji
+                                                           : this.starRenderBindGroup);
             starPass.draw(numStars * 6);
             starPass.end();
         }
