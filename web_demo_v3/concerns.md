@@ -171,3 +171,28 @@
 - Verified after fix: headless + motion tests pass (10k: 0.902/1.051; motion
   0.936/1.102; 1M @ 60 fps: 0.972/1.041); full toggle sweep (emoji x graveyard x
   field) zero GPU/JS issues; emoji screenshot confirmed (10k distinct glyphs).
+
+## 2026-07-05: "The cactus never comes back" — user-caught resurrection granularity bug
+
+- User walked to a wall (saw a cactus emoji), backed off just until it died, walked
+  forward again: the cactus never returned. Diagnosis required GPU instrumentation
+  (counters[2]/[3] = deaths/resurrections; window.__starIds identity sample in the
+  stats readback — which exposed ANOTHER bug: starMetaBuf lacked COPY_SRC, so the
+  readback copy invalidated every 60th frame's entire command buffer).
+- Root cause: resurrection matched ghosts at 1-PIXEL cells. The Python reference ran
+  at 64×96 where one cell is 1/6144 of the domain; at 1024² one cell is 1/1048576 —
+  ~50k ghosts occupy ~5% of cells, so births almost never landed on a ghost.
+  Measured on the new test_graveyard_cycle.mjs (scripted walk-back/walk-forward):
+  resurrections = 1.3% of deaths, identity recovery 40.5% ON vs 39.1% OFF (~no
+  benefit). LESSON: a granularity parameter validated at prototype resolution
+  changes SEMANTICS at production resolution — express match radii as
+  resolution-relative, and port tests along with the algorithm.
+- Fix: bucket the ghost MRU grid at ghostBucket = max(1, W/128) px (~8 px at 1024²,
+  matching the Python test's RELATIVE granularity; ≤1% of screen width displacement,
+  where the Python fine-grid tests showed no measurable bias). Result:
+  resurrections 24.6% of deaths, identity recovery 64.3% vs 38.8% OFF.
+  Remaining gap to Python's 84.7% is expected physics: walking kills ~60% of stars
+  per leg, edge deaths are unrecoverable (content truly leaves the frame), and 61k
+  cycle deaths overflowed the 50k ring (5×N capacity, the user's tunable knob).
+- test_graveyard_cycle.mjs added as a permanent test (asserts resurrections fire and
+  ON beats OFF on identity retention).

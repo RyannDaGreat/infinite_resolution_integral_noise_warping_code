@@ -254,7 +254,15 @@ both paths share one display shader.
     for free). starUpdate deaths append ghosts (atomicAdd seq, write slot); births
     read cellHead[birth cell], claim via CAS(cursor, head, 0) → resurrect at ghost
     position with ghost id + fresh strength; CAS failure or empty cell → fresh tent
-    birth. KNOWN DEVIATIONS from the Python reference (all benign, documented after
+    birth. **Resurrection matching is BUCKETED, not per-pixel** (ghostBucket uniform,
+    ~W/128 px): the match radius must be resolution-RELATIVE. Shipped bug (user-caught
+    as "the cactus never comes back"): 1-px cells at 1024² meant ~50k ghosts in ~1M
+    cells → 1.3% resurrection rate; 8-px buckets → 24.6%, walk-away/walk-back identity
+    recovery 64.3% vs 38.8% without the graveyard (test_graveyard_cycle.mjs, which
+    also reads the new counters[2]/[3] death/resurrection diagnostics and
+    window.__starIds published by the stats readback — starMetaBuf needs COPY_SRC
+    for that readback or the whole stats frame's submit is rejected).
+    KNOWN DEVIATIONS from the Python reference (all benign, documented after
     testing): (1) at most one resurrection per cell per frame (head holds only the
     newest ghost; Python popped several) — fallback is a fresh birth so uniformity
     is untouched; (2) no same-frame resurrection (this frame's deaths aren't in

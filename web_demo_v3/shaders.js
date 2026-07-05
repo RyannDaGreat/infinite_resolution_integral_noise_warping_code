@@ -1671,8 +1671,17 @@ struct StarUniforms {
     numStars:  u32,
     ghostCap:  u32,   // graveyard ring capacity = min(5 * numStars, GHOST_CAP)
     flags:     u32,   // bit 0: graveyard enabled
-    _pad0:     u32,
+    // Resurrection match radius in pixels (bucket side). MUST scale with
+    // resolution: at 1-px cells a 1024^2 frame has ~1M cells vs ~50k ghosts,
+    // so births nearly never land on a ghost (measured 1.3% vs Python's 41%).
+    ghostBucket: u32,
     _pad1:     u32,
+}
+
+// Bucket-grid index of pixel cell (col, row) for ghost MRU matching.
+fn ghostBucketIndex(col: u32, row: u32, W: u32, bucket: u32) -> u32 {
+    let bucketCols = (W + bucket - 1u) / bucket;
+    return (row / bucket) * bucketCols + (col / bucket);
 }
 
 // Per-star metadata: strength q (eroded by crowding, dies at 1) + identity.
@@ -1844,7 +1853,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     let col = min(u32(max(p.x, 0.0)), u.W - 1u);
     let row = min(u32(max(p.y, 0.0)), u.H - 1u);
-    atomicMax(&ghostCellHead[row * u.W + col], cur);
+    atomicMax(&ghostCellHead[ghostBucketIndex(col, row, u.W, u.ghostBucket)], cur);
 }
 `;
 
@@ -1866,7 +1875,8 @@ ${starCommonWGSL}
 @group(0) @binding(4) var<storage, read>       rowCdf:    array<f32>;
 @group(0) @binding(5) var<storage, read_write> stars:     array<f32>;
 @group(0) @binding(6) var<storage, read_write> starMeta:  array<StarMeta>;
-// counters[0] = fresh-birth id mint, counters[1] = ghost death sequence
+// counters[0] = fresh-birth id mint, counters[1] = ghost death sequence,
+// counters[2] = cumulative deaths, counters[3] = cumulative resurrections
 @group(0) @binding(7) var<storage, read_write> counters:  array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read_write> ghosts:    array<Ghost>;
 @group(0) @binding(9) var<storage, read>       ghostCellHead: array<u32>; // built by ghostAdvect
@@ -1941,6 +1951,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     if (dead) {
+        atomicAdd(&counters[2], 1u);   // diagnostics: cumulative death count
         // In-bounds dead stars join the graveyard: write the ghost, then
         // publish it by storing cursor = seq + 1 (0 stays the empty sentinel).
         // The ring overwrites the oldest ghost automatically (age eviction).
@@ -1972,7 +1983,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             // see the outer StarWarp manifest for the measured proof).
             var resurrected = false;
             if (graveyard) {
-                let head = ghostCellHead[row * u.W + col];
+                let head = ghostCellHead[ghostBucketIndex(col, row, u.W, u.ghostBucket)];
                 if (head != 0u) {
                     let slot = (head - 1u) % u.ghostCap;
                     let claim = atomicCompareExchangeWeak(&ghosts[slot].cursor, head, 0u);
@@ -1980,6 +1991,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                         pos = vec2f(ghosts[slot].x, ghosts[slot].y);
                         id = ghosts[slot].id;
                         resurrected = true;
+                        atomicAdd(&counters[3], 1u);   // diagnostics
                     }
                 }
             }

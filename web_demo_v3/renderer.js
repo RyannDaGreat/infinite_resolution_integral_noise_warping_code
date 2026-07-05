@@ -384,9 +384,9 @@ export class WebGPURenderer {
         // buffer so the render and stats paths stay untouched.
         // {q, id} interleaved: ONE buffer, so starUpdate stays at 8 storage
         // buffers — the baseline maxStorageBuffersPerShaderStage.
-        this.starMetaBuf = storage(MAX_STARS * 2 * f4, GPUBufferUsage.COPY_DST);
-        // counters[0] = fresh-birth id mint, counters[1] = ghost death sequence.
-        this.starCountersBuf = storage(2 * f4, GPUBufferUsage.COPY_DST);
+        this.starMetaBuf = storage(MAX_STARS * 2 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+        // counters: [0] id mint, [1] ghost death sequence, [2] deaths, [3] resurrections.
+        this.starCountersBuf = storage(4 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
         // Graveyard: ghost ring + per-cell MRU head grid.
         this.ghostBuf = storage(GHOST_CAP * GHOST_STRIDE_BYTES, GPUBufferUsage.COPY_DST);
         this.ghostCellHeadBuf = storage(N * f4, GPUBufferUsage.COPY_DST);
@@ -399,8 +399,9 @@ export class WebGPURenderer {
         this.starRenderUniformBuf = device.createBuffer({
             size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        // Layout: [0, SS*8) positions, [SS*8, SS*16) meta {q,id}, [SS*16, +16) counters.
         this._starStagingBuf = device.createBuffer({
-            size: STAR_STATS_SAMPLE * 2 * f4,
+            size: STAR_STATS_SAMPLE * 4 * f4 + 4 * f4,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
 
@@ -862,7 +863,7 @@ export class WebGPURenderer {
         }
         device.queue.writeBuffer(this.starBuf, 0, data);
         device.queue.writeBuffer(this.starMetaBuf, 0, metaBuf);
-        device.queue.writeBuffer(this.starCountersBuf, 0, new Uint32Array([MAX_STARS, 0]));
+        device.queue.writeBuffer(this.starCountersBuf, 0, new Uint32Array([MAX_STARS, 0, 0, 0]));
         this._clearGraveyard();
     }
 
@@ -1231,8 +1232,12 @@ export class WebGPURenderer {
             }
             const ghostCap = Math.min(GRAVEYARD_MULT * numStars, GHOST_CAP);
             const starFlags = this.graveyardEnabled ? 1 : 0;
+            // ~128 buckets across the frame, whatever the resolution: keeps the
+            // resurrection match radius resolution-relative (like the Python
+            // reference), not a fixed single pixel.
+            const ghostBucket = Math.max(1, Math.round(W / 128));
             device.queue.writeBuffer(this.starUniformBuf, 0,
-                new Uint32Array([W, H, frameSeed, numStars, ghostCap, starFlags, 0, 0]));
+                new Uint32Array([W, H, frameSeed, numStars, ghostCap, starFlags, ghostBucket, 0]));
 
             // Render uniform: tent radius (integer for exact partition-of-unity
             // brightness invariance) and hard-quad half-extent both scale with
@@ -1345,6 +1350,10 @@ export class WebGPURenderer {
         const starSample = Math.min(numStars, STAR_STATS_SAMPLE);
         if (starsMode && this.frameCount % 60 === 0 && !this._starStatsMapping) {
             encoder.copyBufferToBuffer(this.starBuf, 0, this._starStagingBuf, 0, starSample * 2 * 4);
+            encoder.copyBufferToBuffer(this.starMetaBuf, 0,
+                this._starStagingBuf, STAR_STATS_SAMPLE * 8, starSample * 2 * 4);
+            encoder.copyBufferToBuffer(this.starCountersBuf, 0,
+                this._starStagingBuf, STAR_STATS_SAMPLE * 16, 16);
             this._starStatsNeedRead = true;
         }
 
@@ -1378,9 +1387,12 @@ export class WebGPURenderer {
             this._starStatsMapping = true;
             this._starStatsNeedRead = false;
             this._starStagingBuf.mapAsync(GPUMapMode.READ).then(() => {
-                const data = new Float32Array(this._starStagingBuf.getMappedRange().slice(0));
+                const raw = this._starStagingBuf.getMappedRange().slice(0);
                 this._starStagingBuf.unmap();
-                this._computeStarStats(data.subarray(0, starSample * 2), numStars);
+                const positions = new Float32Array(raw, 0, starSample * 2);
+                const metaU32 = new Uint32Array(raw, STAR_STATS_SAMPLE * 8, starSample * 2);
+                const counters = new Uint32Array(raw, STAR_STATS_SAMPLE * 16, 4);
+                this._computeStarStats(positions, numStars, metaU32, counters);
                 this._starStatsMapping = false;
             }).catch(() => { this._starStatsMapping = false; });
         }
@@ -1398,7 +1410,7 @@ export class WebGPURenderer {
      *   data (Float32Array): [sample*2] interleaved (x, y) pixel coords
      *   numStars (number): active star count (reported, not sampled)
      */
-    _computeStarStats(data, numStars) {
+    _computeStarStats(data, numStars, metaU32 = null, counters = null) {
         const { W, H } = this;
         const GRID = 4;
         const cells = new Array(GRID * GRID).fill(0);
@@ -1420,8 +1432,19 @@ export class WebGPURenderer {
             inBoundsFrac: inBounds / sample,
             minOverMean: mean > 0 ? Math.min(...cells) / mean : 0,
             maxOverMean: mean > 0 ? Math.max(...cells) / mean : 0,
+            deaths: counters ? counters[2] : null,
+            resurrections: counters ? counters[3] : null,
         };
-        if (typeof window !== 'undefined') window.__starStats = this.starStats;
+        if (typeof window !== 'undefined') {
+            window.__starStats = this.starStats;
+            // ids of the sampled stars (odd u32 of each {q, id} pair): lets
+            // headless tests measure identity persistence directly.
+            if (metaU32) {
+                const ids = new Array(sample);
+                for (let i = 0; i < sample; i++) ids[i] = metaU32[i * 2 + 1];
+                window.__starIds = ids;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
