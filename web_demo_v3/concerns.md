@@ -222,3 +222,16 @@
   Tent support (effRadius) now equals the star's own half-width in q-size mode.
   StarRenderUniforms + sizeMaxPx (f32[10]); SETTINGS_VERSION 8. Verified: headless
   test passes; 20 px + q-color screenshot checked, zero GPU issues.
+
+## 2026-07-05: q-size iterations (two user corrections in a row)
+
+- "why do they have gradients": q-size scaled the AA TENT kernel up to 20 px,
+  rendering the antialiasing filter itself as a radial-gradient blob. Lesson: a
+  subpixel filter kernel is not a sprite shape. Fix: q-size mode draws solid discs,
+  w = clamp(effRadius − dist + 0.5, 0, 1) — flat interior, ~1 px AA rim.
+- "they should get SMALLER as they die not bigger": flipped the mapping to
+  size = remaining life, width = sizeMax · max(1 − q, 0.15). (The original spec
+  said "circles get smaller the smaller their q" — implemented literally, felt
+  backwards in practice; strength-as-shrinking-life reads correctly.)
+- Verified: headless test passes; 20 px screenshot: big cyan fresh discs, small
+  red dying specks — q-color and q-size semantics now agree.

@@ -247,12 +247,15 @@ both paths share one display shader.
   - **q-color** (`q-color` button, setting `starColorQ`): tints tents by
     turboQ(q) — blue fresh, red near death. Ignored by emoji sprites.
   - **q-size** (`q-size` button + 0–20 px slider, settings `starSizeQ` /
-    `starSizeMax`, default 8 px): a star's full width = starSizeMax ·
-    max(q, SIZE_Q_MIN=0.15) texels — smaller q = smaller star, q→1 = the
-    slider's max (user: fixed base-radius scaling was "too subtle"). Composes
-    with emoji AND q-color (orthogonal). With AA on, the scaled non-integer
-    tent radius trades exact brightness invariance for the size cue
-    (diagnostic view).
+    `starSizeMax`, default 8 px): size = REMAINING LIFE. A star's disc width =
+    starSizeMax · max(1 − q, SIZE_Q_MIN=0.15) texels: fresh stars (q ~ 0) at the
+    slider's full width, SHRINKING as crowding erodes q toward death (user:
+    "they should get smaller as they die"). Rendered as solid discs with a
+    ~1 px antialiased rim — scaling the AA tent kernel instead shows the filter
+    itself as a radial-gradient blob (user: "why do they have gradients").
+    Composes with emoji AND q-color (orthogonal). History: base-radius scaling
+    was "too subtle" → absolute slider; direct q mapping felt backwards →
+    inverted.
   - **GRAVEYARD (REMOVED)**: a ghost-ring resurrection system lived here for a few
     hours — full implementation at git tag `graveyard-final`, loud ===== commit
     titles. Removed because in real 3D play births almost never land in the same

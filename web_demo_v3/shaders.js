@@ -1981,9 +1981,11 @@ struct VsOut {
     var half: f32;
     var rad = u.radius;
     if (u.sizeQ == 1u) {
-        half = 0.5 * u.sizeMaxPx * max(q, SIZE_Q_MIN);
-        rad = max(half, 0.25);                       // tent support = own size
-        if (u.emoji != 1u && u.aa == 1u) { half += 0.5; }
+        // Size = remaining life: fresh stars (q ~ 0) render at the slider's
+        // full width and SHRINK as crowding erodes q toward death at 1.
+        rad = max(0.5 * u.sizeMaxPx * max(1.0 - q, SIZE_Q_MIN), 0.25);
+        half = rad;
+        if (u.emoji != 1u) { half += 1.0; }          // room for the AA rim
     } else {
         half = select(u.hardHalf, u.radius + 0.5, u.aa == 1u);
         if (u.emoji == 1u) { half = u.glyphHalf; }
@@ -2018,7 +2020,12 @@ struct VsOut {
         return vec4f(s.rgb * s.a, s.a);
     }
     var w: f32 = 1.0;
-    if (u.aa == 1u) {
+    if (u.sizeQ == 1u) {
+        // Solid DISC with a ~1px antialiased rim. (Scaling the AA tent kernel
+        // up instead renders the filter itself: a radial-gradient blob.)
+        let d = distance(in.position.xy, in.starPos);
+        w = clamp(in.effRadius - d + 0.5, 0.0, 1.0);
+    } else if (u.aa == 1u) {
         // in.position.xy is the fragment's pixel-center coordinate — the same
         // space the star position lives in, so the tent needs no offsets.
         let d = abs(in.position.xy - in.starPos);
