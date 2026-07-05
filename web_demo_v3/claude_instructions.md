@@ -231,6 +231,13 @@ Tent radius = max(1, round(W/1024)) texels, integer to keep the exactness. AA OF
 draws hard weight-1 quads (retro single-pixel look); 0/1 are sRGB fixed points so
 both paths share one display shader.
 
+- **Field background (added 2026-07-05)**: `field: OFF / E / deficit` button in the
+  Stars settings row — the display shader composites a dimmed (0.35×) turbo colormap
+  of the star density buffer UNDER the stars (linear light, then one sRGB encode).
+  Density maps E/2 (blue = uncovered, mid green = 1, red = pile-up); deficit maps
+  max(1−E, 0). DisplayUniforms.starField u32 (0/1/2, offset 28); starDensityBuf is
+  display binding 5 (read-only; stale outside Stars mode but never read there).
+  Setting `starField`, SETTINGS_VERSION 5.
 - **Variable N**: log-scale slider 10²…10⁶ (decades at 0/25/50/75/100), default 10⁴,
   visible only in Stars mode, persisted. MAX_STARS = 2^20 preallocated (8 MB); N is a
   uniform. All positions are seeded uniform at init, so raising N exposes

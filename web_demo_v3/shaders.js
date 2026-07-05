@@ -1169,6 +1169,7 @@ struct VsOut {
 @group(0) @binding(1) var colorTex:  texture_2d<f32>;
 @group(0) @binding(2) var motionTex: texture_2d<f32>;
 @group(0) @binding(4) var starTex:   texture_2d<f32>;
+@group(0) @binding(5) var<storage, read> starDensity: array<f32>;  // E, only read in Stars mode
 
 struct DisplayUniforms {
     mode:  u32,
@@ -1178,8 +1179,20 @@ struct DisplayUniforms {
     thresholdOn:    u32,
     thresholdValue: f32,
     noiseOpacity:   f32,
+    starField:      u32,   // Stars-mode background: 0 off, 1 density E, 2 deficit
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
+
+// Google's Turbo colormap, polynomial approximation (Mikhailov 2019): t in [0,1] -> linear-ish RGB.
+fn turbo(t: f32) -> vec3f {
+    let x = clamp(t, 0.0, 1.0);
+    let v4 = vec4f(1.0, x, x * x, x * x * x);
+    let v2 = vec2f(v4.w * x, v4.w * x * x);
+    return vec3f(
+        dot(v4, vec4f(0.13572138,  4.61539260, -42.66032258, 132.13108234)) + dot(v2, vec2f(-152.94239396,  59.28637943)),
+        dot(v4, vec4f(0.09140261,  2.19418839,   4.84296658, -14.18503333)) + dot(v2, vec2f(   4.27729857,   2.82956604)),
+        dot(v4, vec4f(0.10667330, 12.64194608, -60.58204836, 110.36276771)) + dot(v2, vec2f( -89.90310912,  27.34824973)));
+}
 
 fn readNoise(col: u32, row: u32) -> vec4f {
     let idx = (row * disp.W + col) * 4u;
@@ -1282,9 +1295,22 @@ fn luminance(c: vec3f) -> f32 {
     // Mode 6: Star warp. starTex holds LINEAR-light star coverage; encode to
     // sRGB here (the canvas expects sRGB-encoded values) so a star split
     // across pixels keeps the same total perceived brightness as a centered one.
+    // Optional background field under the stars (turbo colormap, dimmed so the
+    // stars stay readable): density E (0 -> blue, 1 -> mid, >=2 -> red) or the
+    // deficit max(1 - E, 0), composited in linear light before the sRGB encode.
     if (disp.mode == 6u) {
-        let c = srgbEncode(clamp(textureLoad(starTex, vec2u(col, row), 0).r, 0.0, 1.0));
-        return vec4f(c, c, c, 1.0);
+        let c = clamp(textureLoad(starTex, vec2u(col, row), 0).r, 0.0, 1.0);
+        var bg = vec3f(0.0);
+        const BG_DIM = 0.35;   // background luminance cap: keeps stars readable
+        if (disp.starField != 0u) {
+            let e = starDensity[row * disp.W + col];
+            let t = select(clamp(1.0 - e, 0.0, 1.0),   // 2: deficit
+                           clamp(e * 0.5, 0.0, 1.0),   // 1: density, 1 -> mid scale
+                           disp.starField == 1u);
+            bg = clamp(turbo(t), vec3f(0.0), vec3f(1.0)) * BG_DIM;
+        }
+        let rgb = bg * (1.0 - c) + vec3f(c);           // stars over field, linear light
+        return vec4f(srgbEncode(rgb.r), srgbEncode(rgb.g), srgbEncode(rgb.b), 1.0);
     }
     // Mode 5: Raw noise
     return applyThreshold(noiseToDisplay(col, row));

@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 4;
+const SETTINGS_VERSION = 5;
 
 /**
  * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
@@ -49,6 +49,7 @@ const DEFAULTS = {
     daySpeed: 20,       // 0-300 → 0.0-3.0 multiplier (20 = 0.2x = 5x slower)
     starCount: 50,      // log slider → 10^4 stars (see starCountFromSlider)
     starAA: true,       // antialiased stars (linear-light tent, constant brightness)
+    starField: 0,       // background under stars: 0 off, 1 density E, 2 deficit (turbo)
 };
 
 function loadSettings() {
@@ -93,6 +94,7 @@ export class UIManager {
         this.starCountSlider = document.getElementById('starCountSlider');
         this.starCountLabel = document.getElementById('starCountLabel');
         this.starAABtn = document.getElementById('starAABtn');
+        this.starFieldBtn = document.getElementById('starFieldBtn');
         this.resetSceneBtn = document.getElementById('resetSceneBtn');
         this.slowMoBtn = document.getElementById('slowMoBtn');
         this.timeMiddayBtn = document.getElementById('timeMidday');
@@ -166,6 +168,8 @@ export class UIManager {
         this.starCountLabel.textContent = formatStarCount(starCountFromSlider(s.starCount));
         this.starAABtn.textContent = `AA: ${s.starAA ? 'ON' : 'OFF'}`;
         this.starAABtn.classList.toggle('on', s.starAA);
+        this.starFieldBtn.textContent = `field: ${['OFF', 'E', 'deficit'][s.starField]}`;
+        this.starFieldBtn.classList.toggle('on', s.starField !== 0);
         // Sync mode bar
         for (const btn of this.modeBtns) {
             btn.classList.toggle('on', parseInt(btn.dataset.mode) === this.displayMode);
@@ -193,6 +197,7 @@ export class UIManager {
         renderer.daySpeedMultiplier = s.daySpeed / 100;
         renderer.numStars = starCountFromSlider(s.starCount);
         renderer.starAAEnabled = s.starAA;
+        renderer.starFieldView = s.starField;
     }
 
     /**
@@ -256,6 +261,9 @@ export class UIManager {
             s.starCount = parseInt(this.starCountSlider.value); update();
         });
         this.starAABtn.addEventListener('click', () => { s.starAA = !s.starAA; update(); });
+        this.starFieldBtn.addEventListener('click', () => {
+            s.starField = (s.starField + 1) % 3; update();
+        });
         this.shadowsBtn.addEventListener('click', () => { s.shadows = !s.shadows; update(); });
         this.pointLightsBtn.addEventListener('click', () => { s.pointLights = !s.pointLights; update(); });
         this.terrainBtn.addEventListener('click', () => { s.terrain = !s.terrain; update(); });

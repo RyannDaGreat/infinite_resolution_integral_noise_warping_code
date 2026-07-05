@@ -131,3 +131,18 @@
   100% in-bounds 0.902/1.051; motion test 0.928/1.080; 1M stars 60 fps 0.980/1.046.
 - Fixed test_headless.mjs: `const URL` shadowed the global URL constructor,
   breaking --serve. Renamed PAGE_URL.
+
+## 2026-07-05: Stars-mode background field view (turbo)
+
+- User: "view the fields below the stars (maybe the turbo colormap)". Added
+  `field: OFF / E / deficit` button to the Stars settings row: display shader
+  (mode 6) composites a dimmed (0.35x) turbo colormap of the star density buffer
+  under the stars in linear light before the single sRGB encode. Density view maps
+  E/2 (0 uncovered = blue, 1 = mid green, >=2 pile-up = red); deficit view maps
+  max(1-E,0). New DisplayUniforms field starField (u32, offset 28 — buffer was
+  already 32 B); starDensityBuf bound read-only at display binding 5 (stale in
+  non-Stars modes, never read there). SETTINGS_VERSION 4 -> 5 (new starField key).
+- Verified headless: test_headless + test_stars_motion still pass; scripted
+  click-through OFF->E->deficit->OFF renders with zero console errors; screenshot
+  with E field shows uniform mid-turbo green under a static camera (E == 1
+  everywhere) as expected.

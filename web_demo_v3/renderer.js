@@ -176,6 +176,7 @@ export class WebGPURenderer {
         this._wasLocked = false;
         this.numStars = 10000;
         this.starAAEnabled = true;
+        this.starFieldView = 0;   // 0 off, 1 density E, 2 deficit — turbo bg under stars
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -564,6 +565,7 @@ export class WebGPURenderer {
                 { binding: 2, resource: this.motionTexView },
                 { binding: 3, resource: buf(this.displayUniformBuf) },
                 { binding: 4, resource: this.starTexView },
+                { binding: 5, resource: buf(this.starDensityBuf) },
             ],
         });
 
@@ -933,6 +935,7 @@ export class WebGPURenderer {
         dispU32[4] = this.thresholdOn || 0;
         dispF32[5] = this.thresholdValue || 0;
         dispF32[6] = this.noiseOpacity;
+        dispU32[7] = this.starFieldView;
         device.queue.writeBuffer(this.displayUniformBuf, 0, dispBuf);
 
         const encoder = device.createCommandEncoder();
