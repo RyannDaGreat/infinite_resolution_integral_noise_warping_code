@@ -115,3 +115,19 @@
   motion. PASS.
 - Lesson: never commit node_modules symlinks — legacy Pages/Jekyll dies on them
   and the failure is silent unless you check the Pages build API/settings.
+
+## 2026-07-05: Stars mode death rule → star strength (v3)
+
+- starUpdate no longer rolls a survival coin. Each star has a strength q ~ U[0,1)
+  (new starStrengthBuf, stride-1 f32, binding 6 on starUpdate only); crowding
+  multiplies it (q *= max(E,1) at the new position) and the star dies at q >= 1.
+  Statistically identical to the old coin (inverse-CDF of the death time; proof +
+  head-to-head simulation in the outer StarWarp manifest/concerns, 2026-07-05).
+  Death is now RNG-free; PCG is used only for respawn draws. Render + stats paths
+  untouched (positions stay stride-2).
+- Do NOT threshold a fixed q per frame instead of eroding: survivors become immune
+  to repeat thinning; contraction collapses all stars into a clump (measured).
+- Verified headless: noise mode unchanged (mean 0.0004, std 0.9998); stars 10k
+  100% in-bounds 0.902/1.051; motion test 0.928/1.080; 1M stars 60 fps 0.980/1.046.
+- Fixed test_headless.mjs: `const URL` shadowed the global URL constructor,
+  breaking --serve. Renamed PAGE_URL.

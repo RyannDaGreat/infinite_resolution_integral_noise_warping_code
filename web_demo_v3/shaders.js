@@ -1619,8 +1619,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 // Star Warp: splat density, deficit scans, star update, star render
 //
 // The point-process analog of the noise warp: N stars advect along the motion
-// field; deaths thin pile-ups (density > 1) back to uniform, births fill the
-// deficit (density < 1), so every frozen frame is a uniform random star field.
+// field; deaths thin pile-ups (density > 1) back to uniform via per-star
+// strength erosion (see starUpdateWGSL), births fill the deficit (density < 1),
+// so every frozen frame is a uniform random star field.
 // Density is measured by forward-splatting uniform mass along the flow — NOT
 // the flow Jacobian, which is blind to translations (uncovered edge strips)
 // and fold-overs (det == 1 pile-ups). See web_demo_v3/claude_instructions.md.
@@ -1741,8 +1742,14 @@ fn main() {
 }
 `;
 
-// Per-star: advect along the flow, die out-of-frame or in pile-ups
-// (survive w.p. 1/max(E,1) at the NEW position), respawn from the deficit CDF.
+// Per-star: advect along the flow, die out-of-frame or by strength exhaustion —
+// each star's strength q (U[0,1) at birth) is multiplied by max(E,1) at the NEW
+// position and the star dies at q >= 1. Deterministic, RNG-free death: exactly
+// the coin rule "survive w.p. 1/max(E,1)" via inverse-CDF sampling of the death
+// time (alive after n frames iff q < prod 1/max(E,1)). RNG is only used for
+// respawns from the deficit CDF. Do NOT threshold a fixed q per frame instead
+// of eroding: survivors would become immune to repeat thinning and persistent
+// contraction collapses all stars into a clump (measured — StarWarp concerns.md).
 export const starUpdateWGSL = /* wgsl */`
 ${starCommonWGSL}
 
@@ -1752,6 +1759,7 @@ ${starCommonWGSL}
 @group(0) @binding(3) var<storage, read>       rowPrefix: array<f32>;
 @group(0) @binding(4) var<storage, read>       rowCdf:    array<f32>;
 @group(0) @binding(5) var<storage, read_write> stars:     array<f32>;
+@group(0) @binding(6) var<storage, read_write> strengths: array<f32>;
 
 // Bilinear sample of the motion texture at continuous pixel position p,
 // border-clamped in texel-index space.
@@ -1801,7 +1809,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (i >= u.numStars) { return; }
 
     var pos = vec2f(stars[i * 2u], stars[i * 2u + 1u]);
-    var rng: u32 = pcg(u.frameSeed * 104729u + i);
+    var q = strengths[i];
+    var rng: u32 = pcg(u.frameSeed * 104729u + i);  // births only; death is RNG-free
 
     // Advect: flow sampled at the OLD position.
     let m = sampleMotion(pos);
@@ -1811,13 +1820,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     var dead = pos.x < 0.0 || pos.x > domain.x || pos.y < 0.0 || pos.y > domain.y;
 
     if (!dead) {
-        // Crowding death at the NEW position: thin pile-ups back to uniform.
+        // Crowding at the NEW position erodes the star's strength; die at 1.
+        // E <= 1 (uncrowded covered space) leaves q untouched — never kills.
         let e = sampleDensity(pos);
-        let survival = 1.0 / max(e, 1.0);
-        if (rand01(&rng) >= survival) { dead = true; }
+        q *= max(e, 1.0);
+        if (q >= 1.0) { dead = true; }
     }
 
     if (dead) {
+        q = rand01(&rng);  // fresh strength at birth
         let total = rowCdf[u.H - 1u];
         if (total <= 1e-6) {
             // No deficit anywhere: respawn uniformly (the quota must hold).
@@ -1839,6 +1850,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     stars[i * 2u]      = pos.x;
     stars[i * 2u + 1u] = pos.y;
+    strengths[i]       = q;
 }
 `;
 

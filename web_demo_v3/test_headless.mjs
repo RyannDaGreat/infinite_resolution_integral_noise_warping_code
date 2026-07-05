@@ -11,7 +11,7 @@ import { spawn } from 'child_process';
 import { setTimeout as sleep } from 'timers/promises';
 
 const PORT = 8082;
-const URL = `http://localhost:${PORT}/web_demo_v3/`;
+const PAGE_URL = `http://localhost:${PORT}/web_demo_v3/`;
 
 async function main() {
     const doServe = process.argv.includes('--serve');
@@ -44,8 +44,8 @@ async function main() {
         });
         page.on('pageerror', err => errors.push(err.message));
 
-        console.log(`Navigating to ${URL}...`);
-        await page.goto(URL, { timeout: 30000, waitUntil: 'networkidle0' });
+        console.log(`Navigating to ${PAGE_URL}...`);
+        await page.goto(PAGE_URL, { timeout: 30000, waitUntil: 'networkidle0' });
 
         // Wait for rendering to stabilize
         await sleep(5000);

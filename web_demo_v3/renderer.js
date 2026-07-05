@@ -229,8 +229,8 @@ export class WebGPURenderer {
             this.bnBackupBuf,
             this.bnBlurHUniformBuf,
             ...(this.bnBlurVUniformBufs || []),
-            this.starBuf, this.starDensityBuf, this.starRowPrefixBuf, this.starRowCdfBuf,
-            this.starUniformBuf, this.starRenderUniformBuf, this._starStagingBuf,
+            this.starBuf, this.starStrengthBuf, this.starDensityBuf, this.starRowPrefixBuf,
+            this.starRowCdfBuf, this.starUniformBuf, this.starRenderUniformBuf, this._starStagingBuf,
             this.boxVB, this.sphereVB, this.quadVB, this.terrainVB,
         ];
         if (this.hasTimestamps) bufs.push(this.querySet, this.tsResolveBuf, this.tsReadBuf);
@@ -335,6 +335,10 @@ export class WebGPURenderer {
             size: MAX_STARS * 2 * f4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
+        // Star strength q per star: U[0,1) at birth, eroded by crowding in
+        // starUpdate, dies at q >= 1. Separate stride-1 buffer so the render
+        // and stats paths keep reading the stride-2 position buffer untouched.
+        this.starStrengthBuf = storage(MAX_STARS * f4, GPUBufferUsage.COPY_DST);
         this.starDensityBuf   = storage(N * f4, GPUBufferUsage.COPY_DST);  // E (CAS-atomic f32)
         this.starRowPrefixBuf = storage(N * f4);       // per-row deficit prefix sums
         this.starRowCdfBuf    = storage(this.H * f4);  // row CDF; last entry = total deficit
@@ -597,6 +601,7 @@ export class WebGPURenderer {
                 { binding: 3, resource: buf(this.starRowPrefixBuf) },
                 { binding: 4, resource: buf(this.starRowCdfBuf) },
                 { binding: 5, resource: buf(this.starBuf) },
+                { binding: 6, resource: buf(this.starStrengthBuf) },
             ],
         });
         this.starRenderBindGroup = device.createBindGroup({
@@ -758,20 +763,24 @@ export class WebGPURenderer {
     }
 
     /**
-     * Seed ALL MAX_STARS positions uniformly over [0, W] x [0, H], not just the
-     * active N: raising N mid-run then exposes stale-but-uniform stars, which is
-     * spatially valid (uniform is uniform) and artifact-free.
-     * Not pure: writes to GPU buffer.
+     * Seed ALL MAX_STARS positions uniformly over [0, W] x [0, H] and all
+     * strengths uniformly over [0, 1), not just the active N: raising N mid-run
+     * then exposes stale-but-uniform stars, which is spatially valid (uniform is
+     * uniform, and among living stars q is uniform too) and artifact-free.
+     * Not pure: writes to GPU buffers.
      */
     _initStars() {
         const { H, W, device } = this;
         const rng = makeRng(777);
         const data = new Float32Array(MAX_STARS * 2);
+        const strengths = new Float32Array(MAX_STARS);
         for (let i = 0; i < MAX_STARS; i++) {
             data[i * 2]     = rng() * W;
             data[i * 2 + 1] = rng() * H;
+            strengths[i]    = rng();
         }
         device.queue.writeBuffer(this.starBuf, 0, data);
+        device.queue.writeBuffer(this.starStrengthBuf, 0, strengths);
     }
 
     _updateBlurUniforms() {

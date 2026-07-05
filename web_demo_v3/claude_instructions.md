@@ -207,10 +207,18 @@ mutually exclusive displays, freeing the ~12 ms warp budget):
    sums (last column = row total).
 4. **starScanCdf** (1 thread): prefix over row totals → row CDF; last entry = total.
 5. **starUpdate** (N threads): advect star by bilinearly-sampled motion (at its OLD
-   position); death = out-of-frame OR crowding (survive w.p. 1/max(E,1), E sampled at
-   the NEW position, PCG RNG); dead stars respawn via 2-level CDF binary search
-   (row, then column within row) + tent jitter, reflected at borders. If total
+   position); death = out-of-frame OR strength exhausted. Each star carries a
+   **star strength** q ~ U[0,1) (assigned at birth, stored in starStrengthBuf,
+   stride-1 f32 alongside the stride-2 position buffer): crowding erodes it,
+   q *= max(E, 1) with E sampled at the NEW position, and the star dies when
+   q >= 1. Death consumes NO RNG (deterministic given the flow; inverse-CDF
+   sampling of the old "survive w.p. 1/max(E,1)" coin — statistics identical,
+   proven + simulated in the StarWarp manifest/concerns one level up, 2026-07-05).
+   Dead stars respawn via 2-level CDF binary search (row, then column within row)
+   + tent jitter, reflected at borders, with fresh q from the PCG RNG. If total
    deficit ≈ 0, respawn uniformly (quota: star count is exactly N every frame).
+   Do NOT threshold a fixed q per frame instead of eroding — survivors become
+   immune to repeat thinning and contraction collapses all stars into a clump.
 6. **starRender**: N·6 vertices (a quad per star) into starTex (rgba16float,
    additive blend); display mode 6 reads starTex over a black background.
 
