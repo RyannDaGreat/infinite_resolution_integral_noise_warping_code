@@ -231,55 +231,34 @@ Tent radius = max(1, round(W/1024)) texels, integer to keep the exactness. AA OF
 draws hard weight-1 quads (retro single-pixel look); 0/1 are sRGB fixed points so
 both paths share one display shader.
 
-- **Star ids + graveyard + emoji view (added 2026-07-05, ported from the Python
-  reference tested in the outer StarWarp repo)**:
-  - **Ids**: starMetaBuf interleaves {q: f32, id: u32} per star (ids seeded
-    0..MAX_STARS−1); fresh births mint ids from starCountersBuf[0] (atomic, starts at
-    MAX_STARS). Resurrection keeps the ghost's id. WHY interleaved: starUpdate must
-    stay at EXACTLY 8 storage buffers (density, rowPrefix, rowCdf, stars, starMeta,
-    counters, ghosts, ghostCellHead) — the BASELINE maxStorageBuffersPerShaderStage
-    is 8, and exceeding it invalidates the pipeline, which invalidates every command
-    buffer touching it → total black screen (shipped once; caught by the user's
-    console). We also request the adapter's own limit at requestDevice, but the
-    8-buffer layout is what guarantees baseline hardware works. counters[1] is the
-    ghost death sequence (reset on graveyard clear; the id mint is NOT reset).
-    WGSL trap: `meta` is a RESERVED KEYWORD — the binding is named starMeta.
-  - **Graveyard** (toggle, default ON, setting `starGraveyard`): ring buffer of
-    GHOST_CAP = 2^20 Ghost structs {x, y, id, cursor:atomic}; effective capacity
-    min(5·N, GHOST_CAP) via ring slot = seq % ghostCap (uniform). cursor = seq+1;
-    0 = empty/claimed tombstone. Per frame (before starUpdate):
-    clearBuffer(ghostCellHeadBuf) → **ghostAdvect** pass (GHOST_CAP threads): advect
-    live ghosts by the motion field, tombstone out-of-bounds, atomicMax(cellHead[cell],
-    cursor) — the per-cell max cursor IS the most-recently-dead ghost (MRU selection
-    for free). starUpdate deaths append ghosts (atomicAdd seq, write slot); births
-    read cellHead[birth cell], claim via CAS(cursor, head, 0) → resurrect at ghost
-    position with ghost id + fresh strength; CAS failure or empty cell → fresh tent
-    birth. **Resurrection matching is BUCKETED, not per-pixel** (ghostBucket uniform,
-    ~W/128 px): the match radius must be resolution-RELATIVE. Shipped bug (user-caught
-    as "the cactus never comes back"): 1-px cells at 1024² meant ~50k ghosts in ~1M
-    cells → 1.3% resurrection rate; 8-px buckets → 24.6%, walk-away/walk-back identity
-    recovery 64.3% vs 38.8% without the graveyard (test_graveyard_cycle.mjs, which
-    also reads the new counters[2]/[3] death/resurrection diagnostics and
-    window.__starIds published by the stats readback — starMetaBuf needs COPY_SRC
-    for that readback or the whole stats frame's submit is rejected).
-    KNOWN DEVIATIONS from the Python reference (all benign, documented after
-    testing): (1) at most one resurrection per cell per frame (head holds only the
-    newest ghost; Python popped several) — fallback is a fresh birth so uniformity
-    is untouched; (2) no same-frame resurrection (this frame's deaths aren't in
-    cellHead) — nearly impossible in Python anyway since a death cell has E>1 hence
-    deficit 0; (3) seq is u32 → ring scrambles once after ~4·10⁹ deaths, self-heals.
-    Graveyard cleared (ghostBuf zeroed, seq reset) on init, N change, or toggle.
-  - **Emoji identity view** (toggle, default OFF, setting `starEmoji`): 61-emoji
-    atlas rasterized at init into an 8×8 × 64px OffscreenCanvas →
-    copyExternalImageToTexture (rgba8unorm). starRender gains ids/atlas/sampler
-    bindings and an emoji uniform: vertex picks the atlas cell by Knuth hash
-    (id·2654435761 mod 61), fragment textureSamples premultiplied. Two pipelines
-    share the shader: additive (one/one, white tent mode) vs premultiplied alpha
-    (one/one−srcα, emoji mode), each with its own bind group ('auto' layouts).
-    White mode now writes alpha = coverage so the display composites stars OVER the
-    field background correctly: rgb_out = bg·(1−α) + star_rgb (linear, then sRGB).
-  - StarUniforms grew to 32 B: {W, H, frameSeed, numStars, ghostCap, flags(bit0 =
-    graveyard), pad, pad}. SETTINGS_VERSION 6.
+- **Star ids + emoji view (added 2026-07-05); graveyard REMOVED same day**:
+  - **Ids**: starMetaBuf interleaves {q: f32, id: u32} per star (seeded
+    0..MAX_STARS−1); fresh births mint ids from starCountersBuf[0] (atomic,
+    starts at MAX_STARS); counters[1] counts deaths (diagnostics, published with
+    window.__starStats; the stats readback also publishes window.__starIds —
+    starMetaBuf carries COPY_SRC for this, or the stats frame's submit is
+    rejected). WGSL trap: `meta` is a RESERVED keyword — binding is starMeta.
+  - **Emoji identity view** (`emoji` button, setting `starEmoji`): 61-glyph atlas
+    rasterized at init (OffscreenCanvas 8×8 × 64px → rgba8unorm); starRender picks
+    the cell by Knuth hash of id, samples premultiplied; separate pipeline with
+    one/one−srcα blending vs the additive white-tent pipeline (two bind groups,
+    'auto' layouts). White tents write alpha = coverage so display composites
+    stars OVER the optional field background in linear light.
+  - **q-color** (`q-color` button, setting `starColorQ`): tints tents by
+    turboQ(q) — blue fresh, red near death. Ignored by emoji sprites.
+  - **q-size** (`q-size` button, setting `starSizeQ`): scales each star's
+    footprint by max(q, SIZE_Q_MIN=0.15) — smaller q = smaller star. Composes
+    with emoji AND q-color (orthogonal). With AA on, the scaled non-integer tent
+    radius trades exact brightness invariance for the size cue (diagnostic view).
+  - **GRAVEYARD (REMOVED)**: a ghost-ring resurrection system lived here for a few
+    hours — full implementation at git tag `graveyard-final`, loud ===== commit
+    titles. Removed because in real 3D play births almost never land in the same
+    bucket as the ghost they should revive (user verdict after the "cactus test";
+    measured story in concerns.md 2026-07-05). Keep 8 storage buffers max per
+    stage in starUpdate — the baseline maxStorageBuffersPerShaderStage; exceeding
+    it invalidates the pipeline and blacks out the whole frame.
+  - StarUniforms back to 16 B {W, H, frameSeed, numStars};
+    StarRenderUniforms 40 B (48 B buffer). SETTINGS_VERSION 7.
 - **Field background (added 2026-07-05)**: `field: OFF / E / deficit` button in the
   Stars settings row — the display shader composites a dimmed (0.35×) turbo colormap
   of the star density buffer UNDER the stars (linear light, then one sRGB encode).

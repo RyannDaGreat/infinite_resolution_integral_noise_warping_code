@@ -196,3 +196,21 @@
   cycle deaths overflowed the 50k ring (5×N capacity, the user's tunable knob).
 - test_graveyard_cycle.mjs added as a permanent test (asserts resurrections fire and
   ON beats OFF on identity retention).
+
+## 2026-07-05 (evening): graveyard REMOVED; q-color + q-size views added
+
+- User verdict after playing: "it never goes into the same bin" — removed the ghost
+  ring, ghostAdvect pass, resurrection, graveyard button, and test_graveyard_cycle.mjs.
+  Full implementation at git tag `graveyard-final` (loud commit titles). Kept ids,
+  emoji view, deaths counter, id readback. StarUniforms back to 16 B; counters
+  shrank to [id mint, deaths]; SETTINGS_VERSION 7.
+- New Stars-row toggles, orthogonal and composable: `q-color` (turbo tint by
+  strength: blue fresh → red near death) and `q-size` (footprint scaled by
+  max(q, 0.15): smaller q = smaller star; also scales emoji sprites; with AA the
+  non-integer tent radius gives up exact brightness invariance — diagnostic view).
+- Verified: headless + motion tests pass (10k 0.904/1.051; 1M @ 60 fps 0.978/1.043);
+  q-color, q-color+q-size, emoji+q-size sweeps render with zero GPU/JS issues
+  (screenshots checked). Removal gotcha: my first strip attempt sliced shaders.js
+  between 'struct StarUniforms' and the FIRST 'fn pcg(' — but other warp shaders
+  define their own pcg earlier, producing an empty slice and a catastrophic
+  str.replace(''): always anchor slice endpoints (src.index(needle, start)).

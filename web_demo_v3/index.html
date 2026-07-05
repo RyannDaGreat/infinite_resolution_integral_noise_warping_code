@@ -106,8 +106,9 @@
             <span id="starCountLabel" style="font-size:11px; min-width:36px; display:inline-block;">10k</span>
             <button id="starAABtn" title="Antialiased stars: linear-light tent splat + sRGB display — constant perceived brightness at any subpixel position">AA: ON</button>
             <button id="starFieldBtn" title="Background field under the stars (turbo colormap): OFF / transported density E / deficit max(1−E, 0)">field: OFF</button>
-            <button id="starEmojiBtn" title="Render each star as an emoji hashed from its persistent identity — watch the same emojis return when the graveyard resurrects them">emoji: OFF</button>
-            <button id="starGraveyardBtn" title="Graveyard: dead stars keep riding the flow as ghosts (capacity 5×N); births in their cell resurrect the same identity at its tracked position">graveyard: ON</button>
+            <button id="starEmojiBtn" title="Render each star as an emoji hashed from its persistent identity">emoji: OFF</button>
+            <button id="starColorQBtn" title="Tint each star by its strength on the Turbo colormap: blue = fresh (q≈0), red = about to die (q→1)">q-color: OFF</button>
+            <button id="starSizeQBtn" title="Scale each star's footprint by its strength: smaller q = smaller star. Composes with emoji and q-color">q-size: OFF</button>
         </span>
     </nav>
 

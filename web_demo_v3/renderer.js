@@ -9,7 +9,6 @@ import {
     buildDeformWGSL, backwardMapWGSL, brownianWGSL, normalizeWGSL,
     blueNoiseBlurWGSL,
     starSplatWGSL, starScanRowsWGSL, starScanCdfWGSL, starUpdateWGSL, starRenderWGSL,
-    ghostAdvectWGSL,
 } from './shaders.js';
 import { MAX_INSTANCES, FLOATS_PER_INSTANCE, TERRAIN_INSTANCE_IDX } from './scene.js';
 
@@ -19,9 +18,6 @@ const NUM_TIMESTAMPS = 12;
 export const STARS_MODE = 6;
 export const MAX_STARS = 1 << 20;      // preallocated star capacity; active N is a uniform
 const STAR_STATS_SAMPLE = 65536;       // positions read back for headless uniformity stats
-const GHOST_CAP = 1 << 20;             // graveyard ring slots (16 B each); capacity uniform = min(5N, this)
-export const GRAVEYARD_MULT = 5;       // ghosts kept per active star (user default; tunable)
-const GHOST_STRIDE_BYTES = 16;         // Ghost struct: x, y, id, cursor
 // Emoji identity atlas: same 61-glyph palette as the report playground; id ->
 // Knuth hash -> cell, so the same identity always renders the same emoji.
 const EMOJIS = ['🍎','🍊','🍋','🍉','🍇','🍓','🍒','🥝','🍍','🥑','🌽','🥕','🍄','🌸','🌻',
@@ -191,8 +187,8 @@ export class WebGPURenderer {
         this.starAAEnabled = true;
         this.starFieldView = 0;   // 0 off, 1 density E, 2 deficit — turbo bg under stars
         this.starEmojiEnabled = false;   // render id-hashed emoji sprites
-        this.graveyardEnabled = true;    // resurrect identities from the ghost ring
-        this._graveyardKey = '';         // clears the graveyard when N/toggle changes
+        this.starColorQEnabled = false;  // tint stars by turbo(strength)
+        this.starSizeQEnabled = false;   // scale star footprint by strength
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -249,7 +245,6 @@ export class WebGPURenderer {
             this.bnBlurHUniformBuf,
             ...(this.bnBlurVUniformBufs || []),
             this.starBuf, this.starMetaBuf, this.starCountersBuf,
-            this.ghostBuf, this.ghostCellHeadBuf,
             this.starRowCdfBuf, this.starUniformBuf, this.starRenderUniformBuf, this._starStagingBuf,
             this.starDensityBuf, this.starRowPrefixBuf,
             this.boxVB, this.sphereVB, this.quadVB, this.terrainVB,
@@ -385,11 +380,8 @@ export class WebGPURenderer {
         // {q, id} interleaved: ONE buffer, so starUpdate stays at 8 storage
         // buffers — the baseline maxStorageBuffersPerShaderStage.
         this.starMetaBuf = storage(MAX_STARS * 2 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
-        // counters: [0] id mint, [1] ghost death sequence, [2] deaths, [3] resurrections.
-        this.starCountersBuf = storage(4 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
-        // Graveyard: ghost ring + per-cell MRU head grid.
-        this.ghostBuf = storage(GHOST_CAP * GHOST_STRIDE_BYTES, GPUBufferUsage.COPY_DST);
-        this.ghostCellHeadBuf = storage(N * f4, GPUBufferUsage.COPY_DST);
+        // counters: [0] fresh-birth id mint, [1] cumulative deaths (diagnostics).
+        this.starCountersBuf = storage(2 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
         this.starDensityBuf   = storage(N * f4, GPUBufferUsage.COPY_DST);  // E (CAS-atomic f32)
         this.starRowPrefixBuf = storage(N * f4);       // per-row deficit prefix sums
         this.starRowCdfBuf    = storage(this.H * f4);  // row CDF; last entry = total deficit
@@ -397,7 +389,7 @@ export class WebGPURenderer {
             size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.starRenderUniformBuf = device.createBuffer({
-            size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         // Layout: [0, SS*8) positions, [SS*8, SS*16) meta {q,id}, [SS*16, +16) counters.
         this._starStagingBuf = device.createBuffer({
@@ -547,7 +539,6 @@ export class WebGPURenderer {
         this.starScanRowsPipeline = computePipeline(mod(starScanRowsWGSL));
         this.starScanCdfPipeline = computePipeline(mod(starScanCdfWGSL));
         this.starUpdatePipeline  = computePipeline(mod(starUpdateWGSL));
-        this.ghostAdvectPipeline = computePipeline(mod(ghostAdvectWGSL));
 
         // Star render: additive blending accumulates LINEAR-light tent coverage.
         const starModule = mod(starRenderWGSL);
@@ -661,17 +652,6 @@ export class WebGPURenderer {
                 { binding: 5, resource: buf(this.starBuf) },
                 { binding: 6, resource: buf(this.starMetaBuf) },
                 { binding: 7, resource: buf(this.starCountersBuf) },
-                { binding: 8, resource: buf(this.ghostBuf) },
-                { binding: 9, resource: buf(this.ghostCellHeadBuf) },
-            ],
-        });
-        this.ghostAdvectBindGroup = device.createBindGroup({
-            layout: this.ghostAdvectPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.starUniformBuf) },
-                { binding: 1, resource: this.motionTexView },
-                { binding: 2, resource: buf(this.ghostBuf) },
-                { binding: 3, resource: buf(this.ghostCellHeadBuf) },
             ],
         });
         // Same entries for both render pipelines ('auto' layouts are per-pipeline).
@@ -863,23 +843,7 @@ export class WebGPURenderer {
         }
         device.queue.writeBuffer(this.starBuf, 0, data);
         device.queue.writeBuffer(this.starMetaBuf, 0, metaBuf);
-        device.queue.writeBuffer(this.starCountersBuf, 0, new Uint32Array([MAX_STARS, 0, 0, 0]));
-        this._clearGraveyard();
-    }
-
-    /**
-     * Empty the graveyard: zero every ghost slot (cursor 0 = empty) and the
-     * death sequence counter. Needed on init and whenever N or the graveyard
-     * toggle changes (the ring modulo changes, scrambling slot ownership).
-     * Not pure: submits a GPU command buffer.
-     */
-    _clearGraveyard() {
-        const encoder = this.device.createCommandEncoder();
-        encoder.clearBuffer(this.ghostBuf);
-        encoder.clearBuffer(this.ghostCellHeadBuf);
-        this.device.queue.submit([encoder.finish()]);
-        // reset the death sequence (counters[1]); the id mint (counters[0]) keeps counting
-        this.device.queue.writeBuffer(this.starCountersBuf, 4, new Uint32Array([0]));
+        device.queue.writeBuffer(this.starCountersBuf, 0, new Uint32Array([MAX_STARS, 0]));
     }
 
     _updateBlurUniforms() {
@@ -1224,27 +1188,15 @@ export class WebGPURenderer {
 
         // --- Star warp (Stars display mode only) ---
         if (starsMode) {
-            // N or graveyard-toggle changes scramble the ghost ring: start fresh.
-            const graveyardKey = `${numStars}|${this.graveyardEnabled}`;
-            if (graveyardKey !== this._graveyardKey) {
-                this._graveyardKey = graveyardKey;
-                this._clearGraveyard();
-            }
-            const ghostCap = Math.min(GRAVEYARD_MULT * numStars, GHOST_CAP);
-            const starFlags = this.graveyardEnabled ? 1 : 0;
-            // ~128 buckets across the frame, whatever the resolution: keeps the
-            // resurrection match radius resolution-relative (like the Python
-            // reference), not a fixed single pixel.
-            const ghostBucket = Math.max(1, Math.round(W / 128));
             device.queue.writeBuffer(this.starUniformBuf, 0,
-                new Uint32Array([W, H, frameSeed, numStars, ghostCap, starFlags, ghostBucket, 0]));
+                new Uint32Array([W, H, frameSeed, numStars]));
 
             // Render uniform: tent radius (integer for exact partition-of-unity
             // brightness invariance) and hard-quad half-extent both scale with
             // resolution so stars stay visible at 2048².
             const tentRadius = Math.max(1, Math.round(W / 1024));
             const hardHalf = Math.max(0.5, W / 2048);
-            const srBuf = new ArrayBuffer(32);
+            const srBuf = new ArrayBuffer(48);
             const srU32 = new Uint32Array(srBuf);
             const srF32 = new Float32Array(srBuf);
             srU32[0] = W; srU32[1] = H; srU32[2] = numStars;
@@ -1252,22 +1204,13 @@ export class WebGPURenderer {
             srF32[4] = tentRadius; srF32[5] = hardHalf;
             srU32[6] = this.starEmojiEnabled ? 1 : 0;
             srF32[7] = Math.max(6, Math.round(W / 1024 * GLYPH_HALF_BASE));
+            srU32[8] = this.starColorQEnabled ? 1 : 0;
+            srU32[9] = this.starSizeQEnabled ? 1 : 0;
             device.queue.writeBuffer(this.starRenderUniformBuf, 0, srBuf);
 
             // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
             if (!this.noiseLocked) {
                 encoder.clearBuffer(this.starDensityBuf);
-
-                if (this.graveyardEnabled) {
-                    // Ghosts ride the flow; each publishes itself as its cell's
-                    // MRU resurrection candidate before starUpdate births run.
-                    encoder.clearBuffer(this.ghostCellHeadBuf);
-                    const ghostPass = encoder.beginComputePass();
-                    ghostPass.setPipeline(this.ghostAdvectPipeline);
-                    ghostPass.setBindGroup(0, this.ghostAdvectBindGroup);
-                    ghostPass.dispatchWorkgroups(Math.ceil(ghostCap / 256));
-                    ghostPass.end();
-                }
 
                 const splatPass = encoder.beginComputePass();
                 splatPass.setPipeline(this.starSplatPipeline);
@@ -1353,7 +1296,7 @@ export class WebGPURenderer {
             encoder.copyBufferToBuffer(this.starMetaBuf, 0,
                 this._starStagingBuf, STAR_STATS_SAMPLE * 8, starSample * 2 * 4);
             encoder.copyBufferToBuffer(this.starCountersBuf, 0,
-                this._starStagingBuf, STAR_STATS_SAMPLE * 16, 16);
+                this._starStagingBuf, STAR_STATS_SAMPLE * 16, 8);
             this._starStatsNeedRead = true;
         }
 
@@ -1391,7 +1334,7 @@ export class WebGPURenderer {
                 this._starStagingBuf.unmap();
                 const positions = new Float32Array(raw, 0, starSample * 2);
                 const metaU32 = new Uint32Array(raw, STAR_STATS_SAMPLE * 8, starSample * 2);
-                const counters = new Uint32Array(raw, STAR_STATS_SAMPLE * 16, 4);
+                const counters = new Uint32Array(raw, STAR_STATS_SAMPLE * 16, 2);
                 this._computeStarStats(positions, numStars, metaU32, counters);
                 this._starStatsMapping = false;
             }).catch(() => { this._starStatsMapping = false; });
@@ -1432,8 +1375,7 @@ export class WebGPURenderer {
             inBoundsFrac: inBounds / sample,
             minOverMean: mean > 0 ? Math.min(...cells) / mean : 0,
             maxOverMean: mean > 0 ? Math.max(...cells) / mean : 0,
-            deaths: counters ? counters[2] : null,
-            resurrections: counters ? counters[3] : null,
+            deaths: counters ? counters[1] : null,
         };
         if (typeof window !== 'undefined') {
             window.__starStats = this.starStats;
