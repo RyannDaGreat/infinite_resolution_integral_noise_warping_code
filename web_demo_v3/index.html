@@ -109,6 +109,8 @@
             <button id="starEmojiBtn" title="Render each star as an emoji hashed from its persistent identity">emoji: OFF</button>
             <button id="starColorQBtn" title="Tint each star by its strength on the Turbo colormap: blue = fresh (q≈0), red = about to die (q→1)">q-color: OFF</button>
             <button id="starSizeQBtn" title="Scale each star's footprint by its strength: smaller q = smaller star. Composes with emoji and q-color">q-size: OFF</button>
+            <input type="range" id="starSizeMaxSlider" min="0" max="20" step="0.5" value="8" title="q-size: full width in px of a star about to die (q→1)" style="width:70px; vertical-align:middle; accent-color:#48c;">
+            <span id="starSizeMaxLabel" style="font-size:11px; min-width:32px; display:inline-block;">8px</span>
         </span>
     </nav>
 

@@ -246,10 +246,13 @@ both paths share one display shader.
     stars OVER the optional field background in linear light.
   - **q-color** (`q-color` button, setting `starColorQ`): tints tents by
     turboQ(q) — blue fresh, red near death. Ignored by emoji sprites.
-  - **q-size** (`q-size` button, setting `starSizeQ`): scales each star's
-    footprint by max(q, SIZE_Q_MIN=0.15) — smaller q = smaller star. Composes
-    with emoji AND q-color (orthogonal). With AA on, the scaled non-integer tent
-    radius trades exact brightness invariance for the size cue (diagnostic view).
+  - **q-size** (`q-size` button + 0–20 px slider, settings `starSizeQ` /
+    `starSizeMax`, default 8 px): a star's full width = starSizeMax ·
+    max(q, SIZE_Q_MIN=0.15) texels — smaller q = smaller star, q→1 = the
+    slider's max (user: fixed base-radius scaling was "too subtle"). Composes
+    with emoji AND q-color (orthogonal). With AA on, the scaled non-integer
+    tent radius trades exact brightness invariance for the size cue
+    (diagnostic view).
   - **GRAVEYARD (REMOVED)**: a ghost-ring resurrection system lived here for a few
     hours — full implementation at git tag `graveyard-final`, loud ===== commit
     titles. Removed because in real 3D play births almost never land in the same
@@ -258,7 +261,7 @@ both paths share one display shader.
     stage in starUpdate — the baseline maxStorageBuffersPerShaderStage; exceeding
     it invalidates the pipeline and blacks out the whole frame.
   - StarUniforms back to 16 B {W, H, frameSeed, numStars};
-    StarRenderUniforms 40 B (48 B buffer). SETTINGS_VERSION 7.
+    StarRenderUniforms 44 B (48 B buffer, sizeMaxPx at f32[10]). SETTINGS_VERSION 8.
 - **Field background (added 2026-07-05)**: `field: OFF / E / deficit` button in the
   Stars settings row — the display shader composites a dimmed (0.35×) turbo colormap
   of the star density buffer UNDER the stars (linear light, then one sRGB encode).

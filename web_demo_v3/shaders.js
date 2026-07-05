@@ -1916,6 +1916,7 @@ struct StarRenderUniforms {
     glyphHalf: f32,   // half-extent of an emoji sprite in texels
     colorQ:    u32,   // 1: tint tents by turbo(q) — blue fresh, red near death
     sizeQ:     u32,   // 1: scale every star's footprint by its strength q
+    sizeMaxPx: f32,   // q-size mode: full width in texels of a q~1 star (slider, 0..20)
 }
 
 // Smallest footprint scale in q-size mode: a newborn (q ~ 0) star must still
@@ -1973,16 +1974,22 @@ struct VsOut {
 
     // Quad half-extent: cover the full tent support (+0.5 so every texel whose
     // center lies within the tent gets a fragment); emoji sprites use their own.
-    // q-size: the footprint shrinks with the star's strength (fresh q ~ 0 =
-    // smallest). Composes with emoji sprites and turbo tint. With AA on, the
-    // scaled (non-integer) tent radius trades exact brightness invariance for
-    // the size cue — acceptable in a diagnostic view.
-    let sizeScale = select(1.0, max(q, SIZE_Q_MIN), u.sizeQ == 1u);
-    var half = select(u.hardHalf, u.radius + 0.5, u.aa == 1u);
-    if (u.emoji == 1u) { half = u.glyphHalf; }
-    half *= sizeScale;
+    // q-size: the star's full width becomes sizeMaxPx * max(q, floor) texels —
+    // fresh q ~ 0 = smallest, q -> 1 = the slider's max. Composes with emoji
+    // sprites and turbo tint. With AA on, the scaled (non-integer) tent radius
+    // trades exact brightness invariance for the size cue — a diagnostic view.
+    var half: f32;
+    var rad = u.radius;
+    if (u.sizeQ == 1u) {
+        half = 0.5 * u.sizeMaxPx * max(q, SIZE_Q_MIN);
+        rad = max(half, 0.25);                       // tent support = own size
+        if (u.emoji != 1u && u.aa == 1u) { half += 0.5; }
+    } else {
+        half = select(u.hardHalf, u.radius + 0.5, u.aa == 1u);
+        if (u.emoji == 1u) { half = u.glyphHalf; }
+    }
     out.qv = q;
-    out.effRadius = max(u.radius * sizeScale, 0.5);
+    out.effRadius = rad;
     // Triangle-list corners: (-1,-1) (1,-1) (-1,1) / (1,-1) (1,1) (-1,1)
     var offsets = array<vec2f, 6>(
         vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),

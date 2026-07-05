@@ -214,3 +214,11 @@
   between 'struct StarUniforms' and the FIRST 'fn pcg(' — but other warp shaders
   define their own pcg earlier, producing an empty slice and a catastrophic
   str.replace(''): always anchor slice endpoints (src.index(needle, start)).
+
+## 2026-07-05: q-size max slider (user: "size is too subtle")
+
+- Replaced the base-radius q scaling (max star ~2 px at 1024² — invisible) with an
+  absolute size: full width = starSizeMax slider (0–20 px, default 8) × max(q, 0.15).
+  Tent support (effRadius) now equals the star's own half-width in q-size mode.
+  StarRenderUniforms + sizeMaxPx (f32[10]); SETTINGS_VERSION 8. Verified: headless
+  test passes; 20 px + q-color screenshot checked, zero GPU issues.

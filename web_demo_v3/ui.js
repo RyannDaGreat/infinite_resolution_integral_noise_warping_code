@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 7;
+const SETTINGS_VERSION = 8;
 
 /**
  * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
@@ -53,6 +53,7 @@ const DEFAULTS = {
     starEmoji: false,   // emoji identity sprites instead of white tents
     starColorQ: false,  // tint stars by turbo(strength)
     starSizeQ: false,   // scale star footprint by strength
+    starSizeMax: 8,     // q-size: full width in px of a q~1 star (0..20 slider)
 };
 
 function loadSettings() {
@@ -101,6 +102,8 @@ export class UIManager {
         this.starEmojiBtn = document.getElementById('starEmojiBtn');
         this.starColorQBtn = document.getElementById('starColorQBtn');
         this.starSizeQBtn = document.getElementById('starSizeQBtn');
+        this.starSizeMaxSlider = document.getElementById('starSizeMaxSlider');
+        this.starSizeMaxLabel = document.getElementById('starSizeMaxLabel');
         this.resetSceneBtn = document.getElementById('resetSceneBtn');
         this.slowMoBtn = document.getElementById('slowMoBtn');
         this.timeMiddayBtn = document.getElementById('timeMidday');
@@ -182,6 +185,8 @@ export class UIManager {
         this.starColorQBtn.classList.toggle('on', s.starColorQ);
         this.starSizeQBtn.textContent = `q-size: ${s.starSizeQ ? 'ON' : 'OFF'}`;
         this.starSizeQBtn.classList.toggle('on', s.starSizeQ);
+        this.starSizeMaxSlider.value = s.starSizeMax;
+        this.starSizeMaxLabel.textContent = `${s.starSizeMax}px`;
         // Sync mode bar
         for (const btn of this.modeBtns) {
             btn.classList.toggle('on', parseInt(btn.dataset.mode) === this.displayMode);
@@ -213,6 +218,7 @@ export class UIManager {
         renderer.starEmojiEnabled = s.starEmoji;
         renderer.starColorQEnabled = s.starColorQ;
         renderer.starSizeQEnabled = s.starSizeQ;
+        renderer.starSizeMaxPx = s.starSizeMax;
     }
 
     /**
@@ -282,6 +288,9 @@ export class UIManager {
         this.starEmojiBtn.addEventListener('click', () => { s.starEmoji = !s.starEmoji; update(); });
         this.starColorQBtn.addEventListener('click', () => { s.starColorQ = !s.starColorQ; update(); });
         this.starSizeQBtn.addEventListener('click', () => { s.starSizeQ = !s.starSizeQ; update(); });
+        this.starSizeMaxSlider.addEventListener('input', () => {
+            s.starSizeMax = parseFloat(this.starSizeMaxSlider.value); update();
+        });
         this.shadowsBtn.addEventListener('click', () => { s.shadows = !s.shadows; update(); });
         this.pointLightsBtn.addEventListener('click', () => { s.pointLights = !s.pointLights; update(); });
         this.terrainBtn.addEventListener('click', () => { s.terrain = !s.terrain; update(); });

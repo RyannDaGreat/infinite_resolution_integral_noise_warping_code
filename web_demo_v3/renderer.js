@@ -189,6 +189,7 @@ export class WebGPURenderer {
         this.starEmojiEnabled = false;   // render id-hashed emoji sprites
         this.starColorQEnabled = false;  // tint stars by turbo(strength)
         this.starSizeQEnabled = false;   // scale star footprint by strength
+        this.starSizeMaxPx = 8;          // q-size mode: full width of a q~1 star
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -1206,6 +1207,7 @@ export class WebGPURenderer {
             srF32[7] = Math.max(6, Math.round(W / 1024 * GLYPH_HALF_BASE));
             srU32[8] = this.starColorQEnabled ? 1 : 0;
             srU32[9] = this.starSizeQEnabled ? 1 : 0;
+            srF32[10] = this.starSizeMaxPx;
             device.queue.writeBuffer(this.starRenderUniformBuf, 0, srBuf);
 
             // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
