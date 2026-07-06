@@ -266,3 +266,12 @@
 - q-size slider now resolution-relative (user: "if resolution is 2x as large so
   should the size be"): effective width = slider * (W/1024). Same class of fix as
   the graveyard bucket lesson: pixel-denominated parameters must scale with W.
+
+## 2026-07-05: SBS free-viewing ergonomics (green frames + 2x CSS)
+
+- 1px (resolution-scaled) green border around each SBS eye rect as a fusion
+  anchor; canvas CSS size doubles while stereo is active (user picked "increase
+  css size by 2" over halving render resolution). updateCanvas already re-runs
+  on every settings change via onRendererUpdate, so the toggle path was free.
+- Verified: css width 1024px -> 2048px -> back on toggle; full-canvas screenshot
+  shows both framed rects; stereo test suite still green.

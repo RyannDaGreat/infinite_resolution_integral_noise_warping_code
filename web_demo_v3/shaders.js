@@ -1323,13 +1323,23 @@ fn luminance(c: vec3f) -> f32 {
             let rightHalf = col >= halfW;
             let lc = select(col, col - halfW, rightHalf);
             let vrow = i32(row) - i32(disp.H / 4u);
-            if (vrow >= 0 && vrow < i32(disp.H / 2u)) {
-                let u = min(lc * 2u, disp.W - 1u);
-                let v = min(u32(vrow) * 2u, disp.H - 1u);
-                let useRightEye = select(rightHalf, !rightHalf, disp.stereoMode == 1u);
-                let s = select(textureLoad(starTex,  vec2u(u, v), 0),
-                               textureLoad(starTexR, vec2u(u, v), 0), useRightEye);
-                rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
+            let bandH = disp.H / 2u;
+            if (vrow >= 0 && vrow < i32(bandH)) {
+                // Green frame around each eye's rectangle: a fusion anchor for
+                // free-viewing (thickness 1 px at 1024², resolution-scaled).
+                let bw = max(1u, disp.W / 1024u);
+                let onBorder = lc < bw || lc >= halfW - bw ||
+                               u32(vrow) < bw || u32(vrow) >= bandH - bw;
+                if (onBorder) {
+                    rgb = vec3f(0.0, 1.0, 0.0);
+                } else {
+                    let u = min(lc * 2u, disp.W - 1u);
+                    let v = min(u32(vrow) * 2u, disp.H - 1u);
+                    let useRightEye = select(rightHalf, !rightHalf, disp.stereoMode == 1u);
+                    let s = select(textureLoad(starTex,  vec2u(u, v), 0),
+                                   textureLoad(starTexR, vec2u(u, v), 0), useRightEye);
+                    rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
+                }
             }
         } else {
             let sL = clamp(textureLoad(starTex,  vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));

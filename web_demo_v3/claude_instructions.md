@@ -271,7 +271,10 @@ both paths share one display shader.
   (SETTINGS_VERSION 10). SBS is ASPECT-CORRECT: each eye uniformly scaled ×1/2
   into its half (W/2 × H/2 band, vertically letterboxed) — never squeezed, or
   free-viewing breaks; crossed order puts the RIGHT eye's view on the LEFT half
-  for cross-eyed fusion. `IPD` slider (0–0.5 world
+  for cross-eyed fusion; each eye rect gets a 1 px (resolution-scaled) green
+  border as a fusion anchor, and the canvas CSS size DOUBLES while stereo is on
+  (the eye rects are half-scale, so 2x display restores full apparent size; the
+  user chose CSS scaling over halving render resolution). `IPD` slider (0–0.5 world
   units, default 0.12) and `FOV` slider (40–120°, applies in mono too — proj is
   rebuilt in main.js when it changes). Two independent star streams (starBufR /
   starMetaBufR, disjoint id ranges, separate birth RNG seed) each advected by

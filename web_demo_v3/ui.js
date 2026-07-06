@@ -248,10 +248,13 @@ export class UIManager {
     updateCanvas(canvas) {
         const s = this.settings;
         const dpr = s.retina ? (window.devicePixelRatio || 1) : 1;
+        // Stereo: double the CSS size — the SBS eye rects are half-scale, so
+        // 2x display brings each eye back to full apparent size for fusion.
+        const css = s.stereoMode > 0 ? 2 : 1;
         canvas.width = this.W;
         canvas.height = this.H;
-        canvas.style.width = (this.W / dpr) + 'px';
-        canvas.style.height = (this.H / dpr) + 'px';
+        canvas.style.width = (this.W * css / dpr) + 'px';
+        canvas.style.height = (this.H * css / dpr) + 'px';
         canvas.style.imageRendering = s.bilinear ? 'auto' : 'pixelated';
     }
 
