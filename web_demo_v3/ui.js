@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 8;
+const SETTINGS_VERSION = 9;
 
 /**
  * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
@@ -54,6 +54,9 @@ const DEFAULTS = {
     starColorQ: false,  // tint stars by turbo(strength)
     starSizeQ: false,   // scale star footprint by strength
     starSizeMax: 8,     // q-size: full width in px of a q~1 star (0..20 slider)
+    stereoMode: 0,      // 0 off, 1 side-by-side, 2 blend, 3 red-blue anaglyph
+    stereoIpd: 0.12,    // eye baseline, world units
+    fovDeg: 70,         // camera field of view (mono + stereo)
 };
 
 function loadSettings() {
@@ -104,6 +107,11 @@ export class UIManager {
         this.starSizeQBtn = document.getElementById('starSizeQBtn');
         this.starSizeMaxSlider = document.getElementById('starSizeMaxSlider');
         this.starSizeMaxLabel = document.getElementById('starSizeMaxLabel');
+        this.stereoBtn = document.getElementById('stereoBtn');
+        this.stereoIpdSlider = document.getElementById('stereoIpdSlider');
+        this.stereoIpdLabel = document.getElementById('stereoIpdLabel');
+        this.fovSlider = document.getElementById('fovSlider');
+        this.fovLabel = document.getElementById('fovLabel');
         this.resetSceneBtn = document.getElementById('resetSceneBtn');
         this.slowMoBtn = document.getElementById('slowMoBtn');
         this.timeMiddayBtn = document.getElementById('timeMidday');
@@ -131,6 +139,11 @@ export class UIManager {
     get H() { return this.W; }
 
     _persist() { saveSettings(this.settings); }
+
+    // Stereo camera params, consumed by main.js when building eye matrices.
+    get stereoMode() { return this.settings.stereoMode; }
+    get stereoIpd() { return this.settings.stereoIpd; }
+    get fovDeg() { return this.settings.fovDeg; }
 
     syncUI() {
         const s = this.settings;
@@ -187,6 +200,12 @@ export class UIManager {
         this.starSizeQBtn.classList.toggle('on', s.starSizeQ);
         this.starSizeMaxSlider.value = s.starSizeMax;
         this.starSizeMaxLabel.textContent = `${s.starSizeMax}px`;
+        this.stereoBtn.textContent = `stereo: ${['OFF', 'SBS', 'blend', 'red-blue'][s.stereoMode]}`;
+        this.stereoBtn.classList.toggle('on', s.stereoMode !== 0);
+        this.stereoIpdSlider.value = s.stereoIpd;
+        this.stereoIpdLabel.textContent = s.stereoIpd.toFixed(2);
+        this.fovSlider.value = s.fovDeg;
+        this.fovLabel.textContent = `${s.fovDeg}°`;
         // Sync mode bar
         for (const btn of this.modeBtns) {
             btn.classList.toggle('on', parseInt(btn.dataset.mode) === this.displayMode);
@@ -219,6 +238,7 @@ export class UIManager {
         renderer.starColorQEnabled = s.starColorQ;
         renderer.starSizeQEnabled = s.starSizeQ;
         renderer.starSizeMaxPx = s.starSizeMax;
+        // stereo camera params are consumed by main.js each frame (matrix build)
     }
 
     /**
@@ -290,6 +310,15 @@ export class UIManager {
         this.starSizeQBtn.addEventListener('click', () => { s.starSizeQ = !s.starSizeQ; update(); });
         this.starSizeMaxSlider.addEventListener('input', () => {
             s.starSizeMax = parseFloat(this.starSizeMaxSlider.value); update();
+        });
+        this.stereoBtn.addEventListener('click', () => {
+            s.stereoMode = (s.stereoMode + 1) % 4; update();
+        });
+        this.stereoIpdSlider.addEventListener('input', () => {
+            s.stereoIpd = parseFloat(this.stereoIpdSlider.value); update();
+        });
+        this.fovSlider.addEventListener('input', () => {
+            s.fovDeg = parseInt(this.fovSlider.value); update();
         });
         this.shadowsBtn.addEventListener('click', () => { s.shadows = !s.shadows; update(); });
         this.pointLightsBtn.addEventListener('click', () => { s.pointLights = !s.pointLights; update(); });

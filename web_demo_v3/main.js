@@ -73,14 +73,39 @@ async function main() {
 
     document.getElementById('stats').textContent = 'Ready. Click to start.';
 
-    // --- Projection matrix ---
+    // --- Projection matrix (FOV is a live UI setting) ---
     let proj = mat4.create();
-    mat4.perspective(proj, glMatrix.toRadian(70), 1.0, 0.1, 100000);
+    let lastFov = 0;
+    function refreshProj() {
+        if (ui.fovDeg !== lastFov) {
+            lastFov = ui.fovDeg;
+            mat4.perspective(proj, glMatrix.toRadian(lastFov), 1.0, 0.1, 100000);
+        }
+    }
+    refreshProj();
 
-    // --- Prev viewProj for motion vectors ---
+    /**
+     * Pure-ish (reads camera orientation). Left/right stereo eye positions:
+     * the player eye displaced along the camera's horizontal right vector by
+     * ±ipd/2. Parallel cameras (no toe-in).
+     */
+    function stereoEyePositions(center, ipd) {
+        const f = camera.forward();
+        let rx = f[2], rz = -f[0];                 // right = forward × up, XZ plane
+        const len = Math.hypot(rx, rz) || 1;
+        rx = rx / len * ipd / 2; rz = rz / len * ipd / 2;
+        return [
+            { x: center.x - rx, y: center.y, z: center.z - rz },
+            { x: center.x + rx, y: center.y, z: center.z + rz },
+        ];
+    }
+
+    // --- Prev viewProj for motion vectors (center + per stereo eye) ---
     const eyePos = physics.getPlayerEyePos();
     let prevViewProj = mat4.create();
     mat4.mul(prevViewProj, proj, camera.viewMatrix(eyePos));
+    let prevViewProjL = mat4.clone(prevViewProj);
+    let prevViewProjR = mat4.clone(prevViewProj);
 
     // --- Input ---
     let mouseCaptured = false;
@@ -151,9 +176,17 @@ async function main() {
         physics.movePlayer(fx, fz, rx, rz, camera.keys);
 
         // Camera follows player
+        refreshProj();
         const eyePos = physics.getPlayerEyePos();
         const viewProj = mat4.create();
         mat4.mul(viewProj, proj, camera.viewMatrix(eyePos));
+
+        // Stereo eye matrices (built every frame; cheap)
+        const [eyeL, eyeR] = stereoEyePositions(eyePos, ui.stereoIpd);
+        const viewProjL = mat4.create();
+        const viewProjR = mat4.create();
+        mat4.mul(viewProjL, proj, camera.viewMatrix(eyeL));
+        mat4.mul(viewProjR, proj, camera.viewMatrix(eyeR));
 
         // Inverse viewProj for sky ray reconstruction
         const invViewProj = mat4.create();
@@ -198,12 +231,19 @@ async function main() {
             eyePos: [eyePos.x, eyePos.y, eyePos.z],
             eyeDir: [fwd[0], fwd[1], fwd[2]],
             lights,
+            stereo: {
+                mode: ui.stereoMode,
+                viewProjL, viewProjR,
+                prevViewProjL, prevViewProjR,
+            },
         });
         const cpuMs = performance.now() - cpuStart;
         cpuFrameHistory.push(cpuMs);
         if (cpuFrameHistory.length > 200) cpuFrameHistory.shift();
 
         prevViewProj = viewProj;
+        prevViewProjL = viewProjL;
+        prevViewProjR = viewProjR;
         frameSeed++;
 
         // FPS update (1x/sec)

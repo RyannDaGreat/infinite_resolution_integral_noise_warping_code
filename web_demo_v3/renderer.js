@@ -9,6 +9,7 @@ import {
     buildDeformWGSL, backwardMapWGSL, brownianWGSL, normalizeWGSL,
     blueNoiseBlurWGSL,
     starSplatWGSL, starScanRowsWGSL, starScanCdfWGSL, starUpdateWGSL, starRenderWGSL,
+    mergeSelectWGSL,
 } from './shaders.js';
 import { MAX_INSTANCES, FLOATS_PER_INSTANCE, TERRAIN_INSTANCE_IDX } from './scene.js';
 
@@ -190,6 +191,7 @@ export class WebGPURenderer {
         this.starColorQEnabled = false;  // tint stars by turbo(strength)
         this.starSizeQEnabled = false;   // scale star footprint by strength
         this.starSizeMaxPx = 8;          // q-size mode: full width of a q~1 star
+        this._stereoActive = false;      // stars mode + stereo enabled this frame
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -234,6 +236,10 @@ export class WebGPURenderer {
         this.depthTex?.destroy();
         this.shadowTex?.destroy();
         this.starTex?.destroy();
+        this.starTexR?.destroy();
+        this.motionTexR?.destroy();
+        this.crossTexL?.destroy();
+        this.crossTexR?.destroy();
         this.atlasTex?.destroy();
 
         const bufs = [
@@ -246,6 +252,9 @@ export class WebGPURenderer {
             this.bnBlurHUniformBuf,
             ...(this.bnBlurVUniformBufs || []),
             this.starBuf, this.starMetaBuf, this.starCountersBuf,
+            this.starBufR, this.starMetaBufR, this.starUniformBufR, this.cameraUniformBufR,
+            this.mergedPosL, this.mergedMetaL, this.mergedPosR, this.mergedMetaR,
+            this.mergeIndirectL, this.mergeIndirectR,
             this.starRowCdfBuf, this.starUniformBuf, this.starRenderUniformBuf, this._starStagingBuf,
             this.starDensityBuf, this.starRowPrefixBuf,
             this.boxVB, this.sphereVB, this.quadVB, this.terrainVB,
@@ -268,6 +277,19 @@ export class WebGPURenderer {
             size: [W, H], format: 'rgba32float',
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
+        // Stereo: right-eye temporal motion + per-eye cross-eye flow targets.
+        this.motionTexR = device.createTexture({
+            size: [W, H], format: 'rgba32float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this.crossTexL = device.createTexture({   // written by eye L: flow L->R
+            size: [W, H], format: 'rgba16float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this.crossTexR = device.createTexture({   // written by eye R: flow R->L
+            size: [W, H], format: 'rgba16float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
         this.depthTex = device.createTexture({
             size: [W, H], format: 'depth24plus',
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
@@ -280,6 +302,10 @@ export class WebGPURenderer {
         // Star coverage accumulator: LINEAR-light tent splats, sRGB-encoded at display.
         // rgba16float so additive blending of fractional coverage doesn't quantize.
         this.starTex = device.createTexture({
+            size: [W, H], format: 'rgba16float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this.starTexR = device.createTexture({    // right eye (stereo only)
             size: [W, H], format: 'rgba16float',
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
@@ -310,6 +336,10 @@ export class WebGPURenderer {
         this.depthTexView  = this.depthTex.createView();
         this.shadowTexView = this.shadowTex.createView({ aspect: 'depth-only' });
         this.starTexView   = this.starTex.createView();
+        this.starTexRView  = this.starTexR.createView();
+        this.motionTexRView = this.motionTexR.createView();
+        this.crossTexLView = this.crossTexL.createView();
+        this.crossTexRView = this.crossTexR.createView();
         this.atlasTexView  = this.atlasTex.createView();
     }
 
@@ -331,9 +361,12 @@ export class WebGPURenderer {
         this.deformationBuf  = storage(N * 2 * f4);
 
         // Camera uniform: viewProj (64) + prevViewProj (64) + sunDir (16) + lightSpaceMatrix (64)
-        //                 + eyePos (16) + eyeDir (16) = 240 bytes
+        //                 + eyePos (16) + eyeDir (16) + otherViewProj (64) = 304 bytes
         this.cameraUniformBuf = device.createBuffer({
-            size: 240, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 304, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.cameraUniformBufR = device.createBuffer({    // right stereo eye
+            size: 304, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
         // Shadow uniform: lightSpaceMatrix (64 bytes) for the shadow depth pass
@@ -362,7 +395,7 @@ export class WebGPURenderer {
             size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.displayUniformBuf = device.createBuffer({
-            size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
         this._statsStagingBuf = device.createBuffer({
@@ -383,10 +416,32 @@ export class WebGPURenderer {
         this.starMetaBuf = storage(MAX_STARS * 2 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
         // counters: [0] fresh-birth id mint, [1] cumulative deaths (diagnostics).
         this.starCountersBuf = storage(2 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+        // Stereo: an independent right-eye stream + per-eye merge outputs.
+        this.starBufR = device.createBuffer({
+            size: MAX_STARS * 2 * f4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        });
+        this.starMetaBufR = storage(MAX_STARS * 2 * f4, GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+        this.mergedPosL  = storage(2 * MAX_STARS * 2 * f4);
+        this.mergedMetaL = storage(2 * MAX_STARS * 2 * f4);
+        this.mergedPosR  = storage(2 * MAX_STARS * 2 * f4);
+        this.mergedMetaR = storage(2 * MAX_STARS * 2 * f4);
+        // drawIndirect args per eye: [vertexCount, 1, 0, 0]; vertexCount grows atomically.
+        this.mergeIndirectL = device.createBuffer({
+            size: 16, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE |
+                             GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        });
+        this.mergeIndirectR = device.createBuffer({
+            size: 16, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE |
+                             GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        });
         this.starDensityBuf   = storage(N * f4, GPUBufferUsage.COPY_DST);  // E (CAS-atomic f32)
         this.starRowPrefixBuf = storage(N * f4);       // per-row deficit prefix sums
         this.starRowCdfBuf    = storage(this.H * f4);  // row CDF; last entry = total deficit
         this.starUniformBuf = device.createBuffer({
+            size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.starUniformBufR = device.createBuffer({      // right stream: different frameSeed
             size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.starRenderUniformBuf = device.createBuffer({
@@ -394,7 +449,7 @@ export class WebGPURenderer {
         });
         // Layout: [0, SS*8) positions, [SS*8, SS*16) meta {q,id}, [SS*16, +16) counters.
         this._starStagingBuf = device.createBuffer({
-            size: STAR_STATS_SAMPLE * 4 * f4 + 4 * f4,
+            size: STAR_STATS_SAMPLE * 4 * f4 + 8 * f4,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
 
@@ -464,6 +519,7 @@ export class WebGPURenderer {
                 targets: [
                     { format: 'rgba8unorm' },
                     { format: 'rgba32float' },
+                    { format: 'rgba16float' },   // cross-eye flow (zero in mono)
                 ],
             },
             depthStencil: {
@@ -492,6 +548,7 @@ export class WebGPURenderer {
                 targets: [
                     { format: 'rgba8unorm' },
                     { format: 'rgba32float' },
+                    { format: 'rgba16float' },   // cross-eye flow (sky: zero disparity)
                 ],
             },
             depthStencil: {
@@ -540,6 +597,7 @@ export class WebGPURenderer {
         this.starScanRowsPipeline = computePipeline(mod(starScanRowsWGSL));
         this.starScanCdfPipeline = computePipeline(mod(starScanCdfWGSL));
         this.starUpdatePipeline  = computePipeline(mod(starUpdateWGSL));
+        this.mergeSelectPipeline = computePipeline(mod(mergeSelectWGSL));
 
         // Star render: additive blending accumulates LINEAR-light tent coverage.
         const starModule = mod(starRenderWGSL);
@@ -593,15 +651,20 @@ export class WebGPURenderer {
         });
 
         // Scene bind group: camera uniform + instance storage + shadow map + shadow sampler + lights
+        const sceneEntries = (camBuf) => [
+            { binding: 0, resource: buf(camBuf) },
+            { binding: 1, resource: buf(this.instanceBuf) },
+            { binding: 2, resource: this.shadowTexView },
+            { binding: 3, resource: this.shadowSampler },
+            { binding: 4, resource: buf(this.lightUniformBuf) },
+        ];
         this.sceneBindGroup = device.createBindGroup({
             layout: this.scenePipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: buf(this.cameraUniformBuf) },
-                { binding: 1, resource: buf(this.instanceBuf) },
-                { binding: 2, resource: this.shadowTexView },
-                { binding: 3, resource: this.shadowSampler },
-                { binding: 4, resource: buf(this.lightUniformBuf) },
-            ],
+            entries: sceneEntries(this.cameraUniformBuf),
+        });
+        this.sceneBindGroupR = device.createBindGroup({
+            layout: this.scenePipeline.getBindGroupLayout(0),
+            entries: sceneEntries(this.cameraUniformBufR),
         });
 
         // Display bind group
@@ -614,18 +677,25 @@ export class WebGPURenderer {
                 { binding: 3, resource: buf(this.displayUniformBuf) },
                 { binding: 4, resource: this.starTexView },
                 { binding: 5, resource: buf(this.starDensityBuf) },
+                { binding: 6, resource: this.starTexRView },
             ],
         });
 
         // Star warp bind groups
-        this.starSplatBindGroup = device.createBindGroup({
+        const splatGroup = (uniformBuf, texView) => device.createBindGroup({
             layout: this.starSplatPipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: buf(this.starUniformBuf) },
-                { binding: 1, resource: this.motionTexView },
+                { binding: 0, resource: buf(uniformBuf) },
+                { binding: 1, resource: texView },
                 { binding: 2, resource: buf(this.starDensityBuf) },
             ],
         });
+        this.starSplatBindGroup = splatGroup(this.starUniformBuf, this.motionTexView);
+        this.starSplatBindGroupR = splatGroup(this.starUniformBufR, this.motionTexRView);
+        // Stereo merge reuses the SAME splat kernel to transport the other
+        // eye's uniform mass along the cross flow into this eye's density.
+        this.mergeSplatBindGroupL = splatGroup(this.starUniformBuf, this.crossTexRView);
+        this.mergeSplatBindGroupR = splatGroup(this.starUniformBuf, this.crossTexLView);
         this.starScanRowsBindGroup = device.createBindGroup({
             layout: this.starScanRowsPipeline.getBindGroupLayout(0),
             entries: [
@@ -655,6 +725,43 @@ export class WebGPURenderer {
                 { binding: 7, resource: buf(this.starCountersBuf) },
             ],
         });
+        this.starUpdateBindGroupR = device.createBindGroup({
+            layout: this.starUpdatePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: buf(this.starUniformBufR) },
+                { binding: 1, resource: this.motionTexRView },
+                { binding: 2, resource: buf(this.starDensityBuf) },
+                { binding: 3, resource: buf(this.starRowPrefixBuf) },
+                { binding: 4, resource: buf(this.starRowCdfBuf) },
+                { binding: 5, resource: buf(this.starBufR) },
+                { binding: 6, resource: buf(this.starMetaBufR) },
+                { binding: 7, resource: buf(this.starCountersBuf) },
+            ],
+        });
+        // Stereo merge select: own stream + other stream reprojected by the
+        // cross flow, thinned against 1 + transported density (see shader).
+        const mergeGroup = (crossView, ownPos, ownMeta, otherPos, otherMeta, mergedPos, mergedMeta, indirect) =>
+            device.createBindGroup({
+                layout: this.mergeSelectPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: buf(this.starUniformBuf) },
+                    { binding: 1, resource: crossView },
+                    { binding: 2, resource: buf(this.starDensityBuf) },
+                    { binding: 3, resource: buf(ownPos) },
+                    { binding: 4, resource: buf(ownMeta) },
+                    { binding: 5, resource: buf(otherPos) },
+                    { binding: 6, resource: buf(otherMeta) },
+                    { binding: 7, resource: buf(mergedPos) },
+                    { binding: 8, resource: buf(mergedMeta) },
+                    { binding: 9, resource: buf(indirect) },
+                ],
+            });
+        this.mergeSelectBindGroupL = mergeGroup(this.crossTexRView,
+            this.starBuf, this.starMetaBuf, this.starBufR, this.starMetaBufR,
+            this.mergedPosL, this.mergedMetaL, this.mergeIndirectL);
+        this.mergeSelectBindGroupR = mergeGroup(this.crossTexLView,
+            this.starBufR, this.starMetaBufR, this.starBuf, this.starMetaBuf,
+            this.mergedPosR, this.mergedMetaR, this.mergeIndirectR);
         // Same entries for both render pipelines ('auto' layouts are per-pipeline).
         const starRenderEntries = () => [
             { binding: 0, resource: buf(this.starRenderUniformBuf) },
@@ -671,6 +778,27 @@ export class WebGPURenderer {
             layout: this.starRenderPipelineEmoji.getBindGroupLayout(0),
             entries: starRenderEntries(),
         });
+        const mergedRenderEntries = (posBuf, metaBuf) => [
+            { binding: 0, resource: buf(this.starRenderUniformBuf) },
+            { binding: 1, resource: buf(posBuf) },
+            { binding: 2, resource: buf(metaBuf) },
+            { binding: 3, resource: this.atlasTexView },
+            { binding: 4, resource: this.atlasSampler },
+        ];
+        this.mergedRenderBG = {};   // [eye][emoji 0|1] -> bind group
+        for (const [eye, posBuf, metaBuf] of [['L', this.mergedPosL, this.mergedMetaL],
+                                              ['R', this.mergedPosR, this.mergedMetaR]]) {
+            this.mergedRenderBG[eye] = [
+                device.createBindGroup({
+                    layout: this.starRenderPipeline.getBindGroupLayout(0),
+                    entries: mergedRenderEntries(posBuf, metaBuf),
+                }),
+                device.createBindGroup({
+                    layout: this.starRenderPipelineEmoji.getBindGroupLayout(0),
+                    entries: mergedRenderEntries(posBuf, metaBuf),
+                }),
+            ];
+        }
 
         // Build deformation
         this.buildDeformBindGroup = device.createBindGroup({
@@ -831,20 +959,24 @@ export class WebGPURenderer {
      */
     _initStars() {
         const { H, W, device } = this;
-        const rng = makeRng(777);
-        const data = new Float32Array(MAX_STARS * 2);
-        const metaBuf = new ArrayBuffer(MAX_STARS * 2 * 4);   // {q: f32, id: u32}
-        const metaF32 = new Float32Array(metaBuf);
-        const metaU32 = new Uint32Array(metaBuf);
-        for (let i = 0; i < MAX_STARS; i++) {
-            data[i * 2]      = rng() * W;
-            data[i * 2 + 1]  = rng() * H;
-            metaF32[i * 2]   = rng();   // strength q
-            metaU32[i * 2+1] = i;       // identity
-        }
-        device.queue.writeBuffer(this.starBuf, 0, data);
-        device.queue.writeBuffer(this.starMetaBuf, 0, metaBuf);
-        device.queue.writeBuffer(this.starCountersBuf, 0, new Uint32Array([MAX_STARS, 0]));
+        const seed = (posBuf, metaTarget, rngSeed, idBase) => {
+            const rng = makeRng(rngSeed);
+            const data = new Float32Array(MAX_STARS * 2);
+            const metaBuf = new ArrayBuffer(MAX_STARS * 2 * 4);   // {q: f32, id: u32}
+            const metaF32 = new Float32Array(metaBuf);
+            const metaU32 = new Uint32Array(metaBuf);
+            for (let i = 0; i < MAX_STARS; i++) {
+                data[i * 2]      = rng() * W;
+                data[i * 2 + 1]  = rng() * H;
+                metaF32[i * 2]   = rng();          // strength q
+                metaU32[i * 2+1] = idBase + i;     // identity (streams get disjoint ids)
+            }
+            device.queue.writeBuffer(posBuf, 0, data);
+            device.queue.writeBuffer(metaTarget, 0, metaBuf);
+        };
+        seed(this.starBuf, this.starMetaBuf, 777, 0);
+        seed(this.starBufR, this.starMetaBufR, 778, MAX_STARS);
+        device.queue.writeBuffer(this.starCountersBuf, 0, new Uint32Array([2 * MAX_STARS, 0]));
     }
 
     _updateBlurUniforms() {
@@ -913,7 +1045,7 @@ export class WebGPURenderer {
      * @param {number[]} opts.eyePos - [x, y, z] camera world position (for flashlight)
      * @param {number[]} opts.eyeDir - [x, y, z] camera forward unit vector (for flashlight)
      */
-    frame({ viewProj, prevViewProj, invViewProj, instanceData, numBoxInstances, numSphereInstances, numDominoInstances, displayMode, frameSeed, elapsedSecs = 0, eyePos = [0,0,0], eyeDir = [0,0,-1], lights = [] }) {
+    frame({ viewProj, prevViewProj, invViewProj, instanceData, numBoxInstances, numSphereInstances, numDominoInstances, displayMode, frameSeed, elapsedSecs = 0, eyePos = [0,0,0], eyeDir = [0,0,-1], lights = [], stereo = null }) {
         const { device, W, H, N } = this;
         const workgroups256 = Math.ceil(N / 256);
         const brownianWGs = Math.ceil(N / this.brownianWG);
@@ -936,16 +1068,35 @@ export class WebGPURenderer {
         // Covers a 200×200 world-unit area centred at origin, depth range 0..300.
         const lightSpaceMatrix = buildLightSpaceMatrix(sunDir, 200, 300);
 
+        // Stereo is a Stars-mode feature: two eye cameras, two star streams,
+        // merged at render time (report §13). Mono path: otherViewProj ==
+        // viewProj so the cross-eye motion target is exactly zero.
+        const starsModeNow = displayMode === STARS_MODE;
+        const stereoActive = starsModeNow && !!stereo && stereo.mode > 0;
+        this._stereoActive = stereoActive;
+
         // Upload camera uniforms: viewProj (64) + prevViewProj (64) + sunDir (16) + lightSpaceMatrix (64)
-        //                         + eyePos (16) + eyeDir (16) = 240 bytes  (60 floats)
-        const camData = new Float32Array(60);
-        camData.set(viewProj, 0);
-        camData.set(prevViewProj, 16);
-        camData.set(sunDir, 32);
-        camData.set(lightSpaceMatrix, 36);
-        camData.set([eyePos[0], eyePos[1], eyePos[2], 0.0], 52);  // eyePos (vec4f at float index 52)
-        camData.set([eyeDir[0], eyeDir[1], eyeDir[2], 0.0], 56);  // eyeDir (vec4f at float index 56)
-        device.queue.writeBuffer(this.cameraUniformBuf, 0, camData);
+        //                         + eyePos (16) + eyeDir (16) + otherViewProj (64) = 304 bytes (76 floats)
+        const buildCamData = (vp, prevVp, otherVp) => {
+            const camData = new Float32Array(76);
+            camData.set(vp, 0);
+            camData.set(prevVp, 16);
+            camData.set(sunDir, 32);
+            camData.set(lightSpaceMatrix, 36);
+            camData.set([eyePos[0], eyePos[1], eyePos[2], 0.0], 52);
+            camData.set([eyeDir[0], eyeDir[1], eyeDir[2], 0.0], 56);
+            camData.set(otherVp, 60);
+            return camData;
+        };
+        if (stereoActive) {
+            device.queue.writeBuffer(this.cameraUniformBuf, 0,
+                buildCamData(stereo.viewProjL, stereo.prevViewProjL, stereo.viewProjR));
+            device.queue.writeBuffer(this.cameraUniformBufR, 0,
+                buildCamData(stereo.viewProjR, stereo.prevViewProjR, stereo.viewProjL));
+        } else {
+            device.queue.writeBuffer(this.cameraUniformBuf, 0,
+                buildCamData(viewProj, prevViewProj, viewProj));
+        }
 
         // Shadow uniform: lightSpaceMatrix only (used in depth-only shadow pass)
         device.queue.writeBuffer(this.shadowUniformBuf, 0, lightSpaceMatrix);
@@ -987,7 +1138,7 @@ export class WebGPURenderer {
 
         // Display uniforms
         const displayFlags = (this.greyscaleEnabled ? 1 : 0) | (this.uniformDisplayEnabled ? 2 : 0);
-        const dispBuf = new ArrayBuffer(32);
+        const dispBuf = new ArrayBuffer(48);
         const dispU32 = new Uint32Array(dispBuf);
         const dispF32 = new Float32Array(dispBuf);
         dispU32[0] = displayMode;
@@ -997,7 +1148,9 @@ export class WebGPURenderer {
         dispU32[4] = this.thresholdOn || 0;
         dispF32[5] = this.thresholdValue || 0;
         dispF32[6] = this.noiseOpacity;
-        dispU32[7] = this.starFieldView;
+        const stereoNow = displayMode === STARS_MODE && !!stereo && stereo.mode > 0;
+        dispU32[7] = stereoNow ? 0 : this.starFieldView;  // field bg is mono-only
+        dispU32[8] = stereoNow ? stereo.mode : 0;
         device.queue.writeBuffer(this.displayUniformBuf, 0, dispBuf);
 
         const encoder = device.createCommandEncoder();
@@ -1061,60 +1214,68 @@ export class WebGPURenderer {
             clearPass.end();
         }
 
-        // --- Scene render (sky + instanced MRT) ---
-        const scenePass = encoder.beginRenderPass({
-            colorAttachments: [
-                { view: this.colorTexView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] },
-                { view: this.motionTexView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] },
-            ],
-            depthStencilAttachment: {
-                view: this.depthTexView,
-                depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
-            },
-            ...(this.hasTimestamps && !this._tsMapping ? {
-                timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
-            } : {}),
-        });
+        // --- Scene render (sky + instanced MRT), once per eye in stereo ---
+        const encodeScene = (camBindGroup, motionView, crossView, withTimestamps) => {
+            const scenePass = encoder.beginRenderPass({
+                colorAttachments: [
+                    { view: this.colorTexView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] },
+                    { view: motionView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] },
+                    { view: crossView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] },
+                ],
+                depthStencilAttachment: {
+                    view: this.depthTexView,
+                    depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
+                },
+                ...(withTimestamps && this.hasTimestamps && !this._tsMapping ? {
+                    timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
+                } : {}),
+            });
 
-        // Sky background: fullscreen quad at far plane
-        scenePass.setPipeline(this.skyPipeline);
-        scenePass.setBindGroup(0, this.skyBindGroup);
-        scenePass.setVertexBuffer(0, this.quadVB);
-        scenePass.draw(this.quadVertCount);
+            // Sky background: fullscreen quad at far plane
+            scenePass.setPipeline(this.skyPipeline);
+            scenePass.setBindGroup(0, this.skyBindGroup);
+            scenePass.setVertexBuffer(0, this.quadVB);
+            scenePass.draw(this.quadVertCount);
 
-        // Scene geometry on top (depth < 1.0 wins)
-        scenePass.setPipeline(this.scenePipeline);
-        scenePass.setBindGroup(0, this.sceneBindGroup);
+            // Scene geometry on top (depth < 1.0 wins)
+            scenePass.setPipeline(this.scenePipeline);
+            scenePass.setBindGroup(0, camBindGroup);
 
-        // Draw floor (flat box): instance 0
-        scenePass.setVertexBuffer(0, this.boxVB);
-        scenePass.draw(this.boxVertCount, 1, 0, 0);
-
-        // Draw dominoes (beveled box): instances 1..1+numDominoInstances
-        if (numDominoes > 0) {
-            scenePass.setVertexBuffer(0, this.bevelBoxVB);
-            scenePass.draw(this.bevelBoxVertCount, numDominoes, 0, 1);
-        }
-
-        // Draw remaining boxes (maze, tower, marble machine, etc.): instances after dominoes up to numBoxInstances
-        if (numMazeBoxes > 0) {
+            // Draw floor (flat box): instance 0
             scenePass.setVertexBuffer(0, this.boxVB);
-            scenePass.draw(this.boxVertCount, numMazeBoxes, 0, mazeStartIdx);
-        }
+            scenePass.draw(this.boxVertCount, 1, 0, 0);
 
-        // Draw spheres: instances numBoxInstances..numBoxInstances+numSphereInstances-1
-        if (numSphereInstances > 0) {
-            scenePass.setVertexBuffer(0, this.sphereVB);
-            scenePass.draw(this.sphereVertCount, numSphereInstances, 0, numBoxInstances);
-        }
+            // Draw dominoes (beveled box): instances 1..1+numDominoInstances
+            if (numDominoes > 0) {
+                scenePass.setVertexBuffer(0, this.bevelBoxVB);
+                scenePass.draw(this.bevelBoxVertCount, numDominoes, 0, 1);
+            }
 
-        // Draw terrain mesh: single non-instanced draw at TERRAIN_INSTANCE_IDX
-        if (this.terrainEnabled) {
-            scenePass.setVertexBuffer(0, this.terrainVB);
-            scenePass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
-        }
+            // Draw remaining boxes (maze, tower, marble machine, etc.)
+            if (numMazeBoxes > 0) {
+                scenePass.setVertexBuffer(0, this.boxVB);
+                scenePass.draw(this.boxVertCount, numMazeBoxes, 0, mazeStartIdx);
+            }
 
-        scenePass.end();
+            // Draw spheres
+            if (numSphereInstances > 0) {
+                scenePass.setVertexBuffer(0, this.sphereVB);
+                scenePass.draw(this.sphereVertCount, numSphereInstances, 0, numBoxInstances);
+            }
+
+            // Draw terrain mesh
+            if (this.terrainEnabled) {
+                scenePass.setVertexBuffer(0, this.terrainVB);
+                scenePass.draw(this.terrainVertCount, 1, 0, TERRAIN_INSTANCE_IDX);
+            }
+
+            scenePass.end();
+        };
+        // In stereo the "main" pass IS the left eye (its motion drives the L stream).
+        encodeScene(this.sceneBindGroup, this.motionTexView, this.crossTexLView, true);
+        if (stereoActive) {
+            encodeScene(this.sceneBindGroupR, this.motionTexRView, this.crossTexRView, false);
+        }
 
         // --- Warp pipeline ---
         // Track lock transition: on the frame lock engages, bake blue noise
@@ -1191,6 +1352,17 @@ export class WebGPURenderer {
         if (starsMode) {
             device.queue.writeBuffer(this.starUniformBuf, 0,
                 new Uint32Array([W, H, frameSeed, numStars]));
+            if (stereoActive) {
+                // Independent RNG stream for the right eye's births.
+                const seedR = (Math.imul(frameSeed, 2654435761) ^ 0x9e3779b9) >>> 0;
+                device.queue.writeBuffer(this.starUniformBufR, 0,
+                    new Uint32Array([W, H, seedR, numStars]));
+                if (!this.noiseLocked) {
+                    // drawIndirect args reset: [vertexCount, instanceCount, 0, 0]
+                    device.queue.writeBuffer(this.mergeIndirectL, 0, new Uint32Array([0, 1, 0, 0]));
+                    device.queue.writeBuffer(this.mergeIndirectR, 0, new Uint32Array([0, 1, 0, 0]));
+                }
+            }
 
             // Render uniform: tent radius (integer for exact partition-of-unity
             // brightness invariance) and hard-quad half-extent both scale with
@@ -1200,7 +1372,8 @@ export class WebGPURenderer {
             const srBuf = new ArrayBuffer(48);
             const srU32 = new Uint32Array(srBuf);
             const srF32 = new Float32Array(srBuf);
-            srU32[0] = W; srU32[1] = H; srU32[2] = numStars;
+            srU32[0] = W; srU32[1] = H;
+            srU32[2] = stereoActive ? numStars * 2 : numStars;   // vs guard bound
             srU32[3] = this.starAAEnabled ? 1 : 0;
             srF32[4] = tentRadius; srF32[5] = hardHalf;
             srU32[6] = this.starEmojiEnabled ? 1 : 0;
@@ -1211,12 +1384,11 @@ export class WebGPURenderer {
             device.queue.writeBuffer(this.starRenderUniformBuf, 0, srBuf);
 
             // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
-            if (!this.noiseLocked) {
+            const encodeStarStep = (splatGroup, updateGroup) => {
                 encoder.clearBuffer(this.starDensityBuf);
-
                 const splatPass = encoder.beginComputePass();
                 splatPass.setPipeline(this.starSplatPipeline);
-                splatPass.setBindGroup(0, this.starSplatBindGroup);
+                splatPass.setBindGroup(0, splatGroup);
                 splatPass.dispatchWorkgroups(workgroups256);
                 splatPass.end();
 
@@ -1234,24 +1406,62 @@ export class WebGPURenderer {
 
                 const updatePass = encoder.beginComputePass();
                 updatePass.setPipeline(this.starUpdatePipeline);
-                updatePass.setBindGroup(0, this.starUpdateBindGroup);
+                updatePass.setBindGroup(0, updateGroup);
                 updatePass.dispatchWorkgroups(Math.ceil(numStars / 256));
                 updatePass.end();
+            };
+            // Stereo merge: transport the OTHER eye's uniform mass along the
+            // cross flow (same splat kernel), then deterministically select
+            // survivors from own + reprojected-other copies (report §13).
+            const encodeMerge = (splatGroup, selectGroup) => {
+                encoder.clearBuffer(this.starDensityBuf);
+                const splatPass = encoder.beginComputePass();
+                splatPass.setPipeline(this.starSplatPipeline);
+                splatPass.setBindGroup(0, splatGroup);
+                splatPass.dispatchWorkgroups(workgroups256);
+                splatPass.end();
+
+                const selectPass = encoder.beginComputePass();
+                selectPass.setPipeline(this.mergeSelectPipeline);
+                selectPass.setBindGroup(0, selectGroup);
+                selectPass.dispatchWorkgroups(Math.ceil(2 * numStars / 256));
+                selectPass.end();
+            };
+
+            if (!this.noiseLocked) {
+                encodeStarStep(this.starSplatBindGroup, this.starUpdateBindGroup);
+                if (stereoActive) {
+                    encodeStarStep(this.starSplatBindGroupR, this.starUpdateBindGroupR);
+                    encodeMerge(this.mergeSplatBindGroupL, this.mergeSelectBindGroupL);
+                    encodeMerge(this.mergeSplatBindGroupR, this.mergeSelectBindGroupR);
+                }
             }
 
-            // Accumulate LINEAR-light star coverage into starTex (additive blend).
-            const starPass = encoder.beginRenderPass({
-                colorAttachments: [{
-                    view: this.starTexView,
-                    loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0],
-                }],
-            });
-            starPass.setPipeline(this.starEmojiEnabled ? this.starRenderPipelineEmoji
-                                                        : this.starRenderPipeline);
-            starPass.setBindGroup(0, this.starEmojiEnabled ? this.starRenderBindGroupEmoji
-                                                           : this.starRenderBindGroup);
-            starPass.draw(numStars * 6);
-            starPass.end();
+            // Accumulate LINEAR-light star coverage (additive / premultiplied).
+            const emojiIdx = this.starEmojiEnabled ? 1 : 0;
+            const pipeline = this.starEmojiEnabled ? this.starRenderPipelineEmoji
+                                                   : this.starRenderPipeline;
+            const encodeStarRender = (texView, bindGroup, indirectBuf) => {
+                const starPass = encoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: texView,
+                        loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0],
+                    }],
+                });
+                starPass.setPipeline(pipeline);
+                starPass.setBindGroup(0, bindGroup);
+                if (indirectBuf) starPass.drawIndirect(indirectBuf, 0);
+                else starPass.draw(numStars * 6);
+                starPass.end();
+            };
+            if (stereoActive) {
+                encodeStarRender(this.starTexView,  this.mergedRenderBG.L[emojiIdx], this.mergeIndirectL);
+                encodeStarRender(this.starTexRView, this.mergedRenderBG.R[emojiIdx], this.mergeIndirectR);
+            } else {
+                encodeStarRender(this.starTexView,
+                    this.starEmojiEnabled ? this.starRenderBindGroupEmoji : this.starRenderBindGroup,
+                    null);
+            }
         }
 
         // --- Display ---
@@ -1299,6 +1509,10 @@ export class WebGPURenderer {
                 this._starStagingBuf, STAR_STATS_SAMPLE * 8, starSample * 2 * 4);
             encoder.copyBufferToBuffer(this.starCountersBuf, 0,
                 this._starStagingBuf, STAR_STATS_SAMPLE * 16, 8);
+            encoder.copyBufferToBuffer(this.mergeIndirectL, 0,
+                this._starStagingBuf, STAR_STATS_SAMPLE * 16 + 8, 4);
+            encoder.copyBufferToBuffer(this.mergeIndirectR, 0,
+                this._starStagingBuf, STAR_STATS_SAMPLE * 16 + 12, 4);
             this._starStatsNeedRead = true;
         }
 
@@ -1336,7 +1550,7 @@ export class WebGPURenderer {
                 this._starStagingBuf.unmap();
                 const positions = new Float32Array(raw, 0, starSample * 2);
                 const metaU32 = new Uint32Array(raw, STAR_STATS_SAMPLE * 8, starSample * 2);
-                const counters = new Uint32Array(raw, STAR_STATS_SAMPLE * 16, 2);
+                const counters = new Uint32Array(raw, STAR_STATS_SAMPLE * 16, 4);
                 this._computeStarStats(positions, numStars, metaU32, counters);
                 this._starStatsMapping = false;
             }).catch(() => { this._starStatsMapping = false; });
@@ -1378,6 +1592,10 @@ export class WebGPURenderer {
             minOverMean: mean > 0 ? Math.min(...cells) / mean : 0,
             maxOverMean: mean > 0 ? Math.max(...cells) / mean : 0,
             deaths: counters ? counters[1] : null,
+            // merged survivor counts per eye (drawIndirect vertexCount / 6);
+            // in stereo each should hover at ~numStars (merged-view uniformity)
+            mergedL: counters ? Math.floor(counters[2] / 6) : null,
+            mergedR: counters ? Math.floor(counters[3] / 6) : null,
         };
         if (typeof window !== 'undefined') {
             window.__starStats = this.starStats;

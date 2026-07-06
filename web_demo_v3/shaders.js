@@ -209,6 +209,7 @@ struct VsOut {
 struct FsOut {
     @location(0) color:  vec4f,
     @location(1) motion: vec4f,
+    @location(2) cross:  vec4f,   // sky is at infinity: zero stereo disparity
 }
 
 @fragment fn fs(in: VsOut) -> FsOut {
@@ -356,6 +357,7 @@ struct FsOut {
 
     out.color = vec4f(skyColor, 1.0);
     out.motion = vec4f(0.0, 0.0, 0.0, 1.0);
+    out.cross  = vec4f(0.0, 0.0, 0.0, 1.0);
     return out;
 }
 `;
@@ -400,6 +402,8 @@ struct CameraUniforms {
     lightSpaceMatrix: mat4x4f, // for shadow map lookup (offset 144 bytes)
     eyePos:           vec4f,   // xyz = camera world position (offset 208 bytes)
     eyeDir:           vec4f,   // xyz = camera forward unit vector (offset 224 bytes)
+    otherViewProj:    mat4x4f, // the OTHER stereo eye's viewProj (== viewProj in mono):
+                               // drives the cross-eye motion target (offset 240 bytes)
 }
 
 struct InstanceData {
@@ -444,6 +448,7 @@ struct VsOut {
     @location(7) localNormal: vec3f,
     @location(8) tangentWorld: vec3f,
     @location(9) bitangentWorld: vec3f,
+    @location(10) otherClip: vec4f,   // this vertex in the OTHER eye's clip space
 }
 
 @vertex fn vs(in: VsIn) -> VsOut {
@@ -453,6 +458,7 @@ struct VsOut {
     let prevWp = inst.prevModel * vec4f(in.position, 1.0);
     out.currClip   = cam.viewProj * wp;
     out.prevClip   = cam.prevViewProj * prevWp;
+    out.otherClip  = cam.otherViewProj * wp;
     out.color      = inst.color.rgb;
     out.normal     = (inst.model * vec4f(in.normal, 0.0)).xyz;
     out.localPos   = in.position;
@@ -964,6 +970,7 @@ fn terrainBiomeColor(worldPos: vec3f, worldNormal: vec3f) -> vec3f {
 struct FsOut {
     @location(0) color:  vec4f,
     @location(1) motion: vec4f,
+    @location(2) cross:  vec4f,   // cross-eye flow, same 0.5*(NDC delta) convention
 }
 
 @fragment fn fs(in: VsOut) -> FsOut {
@@ -1144,6 +1151,8 @@ struct FsOut {
     let currNDC = in.currClip.xy / in.currClip.w;
     let prevNDC = in.prevClip.xy / in.prevClip.w;
     out.motion = vec4f((currNDC - prevNDC) * 0.5, 0.0, 1.0);
+    let otherNDC = in.otherClip.xy / in.otherClip.w;
+    out.cross = vec4f((otherNDC - currNDC) * 0.5, 0.0, 1.0);   // this eye -> other eye
     return out;
 }
 `;
@@ -1170,6 +1179,7 @@ struct VsOut {
 @group(0) @binding(2) var motionTex: texture_2d<f32>;
 @group(0) @binding(4) var starTex:   texture_2d<f32>;
 @group(0) @binding(5) var<storage, read> starDensity: array<f32>;  // E, only read in Stars mode
+@group(0) @binding(6) var starTexR:  texture_2d<f32>;  // right-eye stars (stereo only)
 
 struct DisplayUniforms {
     mode:  u32,
@@ -1180,6 +1190,7 @@ struct DisplayUniforms {
     thresholdValue: f32,
     noiseOpacity:   f32,
     starField:      u32,   // Stars-mode background: 0 off, 1 density E, 2 deficit
+    stereoMode:     u32,   // 0 off, 1 side-by-side, 2 blend, 3 red-blue anaglyph
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
 
@@ -1298,6 +1309,30 @@ fn luminance(c: vec3f) -> f32 {
     // Optional background field under the stars (turbo colormap, dimmed so the
     // stars stay readable): density E (0 -> blue, 1 -> mid, >=2 -> red) or the
     // deficit max(1 - E, 0), composited in linear light before the sRGB encode.
+    if (disp.mode == 6u && disp.stereoMode != 0u) {
+        // Stereo composites. Each eye's starTex carries premultiplied star rgb
+        // + coverage alpha over black; field background is mono-only.
+        var rgb: vec3f;
+        if (disp.stereoMode == 1u) {
+            // side-by-side: each eye squeezed to half width
+            if (col < disp.W / 2u) {
+                let s = textureLoad(starTex, vec2u(min(col * 2u, disp.W - 1u), row), 0);
+                rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
+            } else {
+                let s = textureLoad(starTexR, vec2u(min((col - disp.W / 2u) * 2u, disp.W - 1u), row), 0);
+                rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
+            }
+        } else {
+            let sL = clamp(textureLoad(starTex,  vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));
+            let sR = clamp(textureLoad(starTexR, vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));
+            if (disp.stereoMode == 2u) {
+                rgb = 0.5 * (sL + sR);                   // 50% blend
+            } else {
+                rgb = vec3f(sL.r, 0.0, sR.b);            // red-blue glasses: red of L, blue of R
+            }
+        }
+        return vec4f(srgbEncode(rgb.r), srgbEncode(rgb.g), srgbEncode(rgb.b), 1.0);
+    }
     if (disp.mode == 6u) {
         // starTex carries premultiplied star color in rgb and coverage in alpha
         // (white tents: rgb == alpha; emoji sprites: atlas colors), so stars
@@ -1896,6 +1931,90 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     stars[i * 2u]      = pos.x;
     stars[i * 2u + 1u] = pos.y;
     starMeta[i]        = StarMeta(q, id);
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Stereo merge select (one per eye per frame): the kept half of the user's
+// hcat warp step, with the provably-dead birth stage skipped. Threads 0..N-1
+// are OWN-stream stars (zero flow); threads N..2N-1 are OTHER-stream stars
+// advected by the cross-eye flow. Survival is the deterministic v3 threshold
+// q * E < 1 with E = 1 (own half's exact zero-flow self-splat) + the OTHER
+// view's transported density (splatted by starSplat into `density` from the
+// cross texture). Copies only — the per-eye streams are never mutated; shared
+// q's make both eyes' merges common-random-numbers coupled (see report §13).
+// Survivors are appended to a compact list consumed via drawIndirect.
+// ---------------------------------------------------------------------------
+export const mergeSelectWGSL = /* wgsl */`
+${starCommonWGSL}
+
+@group(0) @binding(0) var<uniform> u: StarUniforms;
+@group(0) @binding(1) var crossTex: texture_2d<f32>;   // other eye -> this eye flow
+@group(0) @binding(2) var<storage, read> density:   array<f32>;   // transported other-view mass
+@group(0) @binding(3) var<storage, read> ownPos:    array<f32>;
+@group(0) @binding(4) var<storage, read> ownMeta:   array<StarMeta>;
+@group(0) @binding(5) var<storage, read> otherPos:  array<f32>;
+@group(0) @binding(6) var<storage, read> otherMeta: array<StarMeta>;
+@group(0) @binding(7) var<storage, read_write> mergedPos:  array<f32>;
+@group(0) @binding(8) var<storage, read_write> mergedMeta: array<StarMeta>;
+// drawIndirect args: [vertexCount, instanceCount=1, firstVertex, firstInstance]
+@group(0) @binding(9) var<storage, read_write> indirect: array<atomic<u32>>;
+
+fn sampleCross(p: vec2f) -> vec2f {
+    let maxIdx = vec2f(f32(u.W) - 1.0, f32(u.H) - 1.0);
+    let q = clamp(p - 0.5, vec2f(0.0), maxIdx);
+    let q0 = clamp(floor(q), vec2f(0.0), maxIdx - vec2f(1.0));
+    let f = clamp(q - q0, vec2f(0.0), vec2f(1.0));
+    let x0 = u32(q0.x); let y0 = u32(q0.y);
+    let m00 = textureLoad(crossTex, vec2u(x0,      y0     ), 0).rg;
+    let m10 = textureLoad(crossTex, vec2u(x0 + 1u, y0     ), 0).rg;
+    let m01 = textureLoad(crossTex, vec2u(x0,      y0 + 1u), 0).rg;
+    let m11 = textureLoad(crossTex, vec2u(x0 + 1u, y0 + 1u), 0).rg;
+    return mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y);
+}
+
+fn sampleDensity(p: vec2f) -> f32 {
+    let maxIdx = vec2f(f32(u.W) - 1.0, f32(u.H) - 1.0);
+    let q = clamp(p - 0.5, vec2f(0.0), maxIdx);
+    let q0 = clamp(floor(q), vec2f(0.0), maxIdx - vec2f(1.0));
+    let f = clamp(q - q0, vec2f(0.0), vec2f(1.0));
+    let x0 = u32(q0.x); let y0 = u32(q0.y);
+    let d00 = density[y0 * u.W + x0];
+    let d10 = density[y0 * u.W + x0 + 1u];
+    let d01 = density[(y0 + 1u) * u.W + x0];
+    let d11 = density[(y0 + 1u) * u.W + x0 + 1u];
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+    let i = gid.x;
+    if (i >= 2u * u.numStars) { return; }
+
+    var pos: vec2f;
+    var m: StarMeta;
+    if (i < u.numStars) {
+        pos = vec2f(ownPos[i * 2u], ownPos[i * 2u + 1u]);   // own half: zero flow
+        m = ownMeta[i];
+    } else {
+        let j = i - u.numStars;
+        var p = vec2f(otherPos[j * 2u], otherPos[j * 2u + 1u]);
+        let f = sampleCross(p);
+        pos = p + vec2f(f.x * f32(u.W), -f.y * f32(u.H));   // reproject into this eye
+        m = otherMeta[j];
+    }
+
+    let domain = vec2f(f32(u.W), f32(u.H));
+    if (pos.x < 0.0 || pos.x > domain.x || pos.y < 0.0 || pos.y > domain.y) { return; }
+
+    let E = 1.0 + max(sampleDensity(pos), 0.0);
+    if (m.q * E >= 1.0) { return; }                          // deterministic thin to uniform
+
+    let v = atomicAdd(&indirect[0], 6u);                     // 6 vertices per star quad
+    let slot = v / 6u;
+    mergedPos[slot * 2u]      = pos.x;
+    mergedPos[slot * 2u + 1u] = pos.y;
+    mergedMeta[slot] = m;
 }
 `;
 

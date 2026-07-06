@@ -235,3 +235,18 @@
   backwards in practice; strength-as-shrinking-life reads correctly.)
 - Verified: headless test passes; 20 px screenshot: big cyan fresh discs, small
   red dying specks — q-color and q-size semantics now agree.
+
+
+## 2026-07-05 (night): stereo stars shipped
+
+- Spec + soundness analysis were recorded in the outer manifest BEFORE building;
+  Python reference tests passed first (see outer concerns). GPU: scene pass per
+  eye with a third MRT target for cross-eye flow (same trick as motion vectors,
+  other eye's viewProj instead of prev frame's), independent R stream, merges via
+  reused starSplat + new mergeSelect kernel (8 storage buffers exactly — the
+  limit lesson held), drawIndirect for the compact survivor lists.
+- Verified: test_stereo.mjs — merged counts ≈ N (0.983–1.005) in SBS/blend/
+  red-blue, static, under WASD motion, and at IPD 0 and 0.5; zero GPU issues;
+  mono unaffected (headless + 1M-star motion tests pass unchanged). Anaglyph
+  screenshot shows red/blue disparity pairs (same identity in both eyes — the
+  shared-q coupling from the Python tests, 93.7% shared ids there).

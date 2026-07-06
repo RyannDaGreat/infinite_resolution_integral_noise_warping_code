@@ -265,6 +265,24 @@ both paths share one display shader.
     it invalidates the pipeline and blacks out the whole frame.
   - StarUniforms back to 16 B {W, H, frameSeed, numStars};
     StarRenderUniforms 44 B (48 B buffer, sizeMaxPx at f32[10]). SETTINGS_VERSION 8.
+- **Stereo stars (added 2026-07-05; report §13 has the algorithm + proofs)**:
+  `stereo` button cycles OFF / SBS / blend / red-blue; `IPD` slider (0–0.5 world
+  units, default 0.12) and `FOV` slider (40–120°, applies in mono too — proj is
+  rebuilt in main.js when it changes). Two independent star streams (starBufR /
+  starMetaBufR, disjoint id ranges, separate birth RNG seed) each advected by
+  their eye's temporal motion; per-eye render-time merge = the user's hcat warp
+  step with births skipped (provably equivalent — kept-half deficit is 0):
+  starSplat REUSED with the cross texture transports the other eye's mass into
+  this eye's density, then mergeSelect (2N threads, exactly 8 storage buffers)
+  thins own + reprojected-other COPIES by the deterministic q·(1+E) < 1 rule
+  into compact per-eye lists drawn via drawIndirect. Four flows: scene pass per
+  eye MRT-outputs temporal motion + cross-eye motion (CameraUniforms grew to
+  304 B with otherViewProj; mono sets otherViewProj = viewProj so cross ≡ 0;
+  sky writes zero disparity). Field background is mono-only. Stats readback
+  publishes __starStats.mergedL/R (each ≈ N by the merged-uniformity invariant
+  — the test asserts |merged/N − 1| < 6%). SETTINGS_VERSION 9.
+  Measured (test_stereo.mjs): mergedL/R within 0.3–1.7% of N across all modes,
+  static + motion + IPD ∈ {0, 0.5}; mono path bit-identical stats after.
 - **Field background (added 2026-07-05)**: `field: OFF / E / deficit` button in the
   Stars settings row — the display shader composites a dimmed (0.35×) turbo colormap
   of the star density buffer UNDER the stars (linear light, then one sRGB encode).
