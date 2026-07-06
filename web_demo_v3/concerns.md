@@ -275,3 +275,8 @@
   on every settings change via onRendererUpdate, so the toggle path was free.
 - Verified: css width 1024px -> 2048px -> back on toggle; full-canvas screenshot
   shows both framed rects; stereo test suite still green.
+- Bug (user-caught, same evening): the 2x CSS applied to ALL stereo modes, but
+  blend/red-blue render full-frame at full res — upscaling made them "low res
+  and flickery". Now SBS-only (modes 1-2). Lesson: the 2x exists BECAUSE SBS
+  halves the eye scale; tie compensations to the thing they compensate for, not
+  to the enclosing feature flag.

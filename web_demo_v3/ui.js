@@ -248,9 +248,10 @@ export class UIManager {
     updateCanvas(canvas) {
         const s = this.settings;
         const dpr = s.retina ? (window.devicePixelRatio || 1) : 1;
-        // Stereo: double the CSS size — the SBS eye rects are half-scale, so
-        // 2x display brings each eye back to full apparent size for fusion.
-        const css = s.stereoMode > 0 ? 2 : 1;
+        // SBS ONLY: those two modes render each eye at half scale side by
+        // side, so 2x display restores full apparent size. Blend/anaglyph are
+        // full-frame full-res — scaling them just looks low-res.
+        const css = (s.stereoMode === 1 || s.stereoMode === 2) ? 2 : 1;
         canvas.width = this.W;
         canvas.height = this.H;
         canvas.style.width = (this.W * css / dpr) + 'px';

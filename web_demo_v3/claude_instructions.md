@@ -272,9 +272,10 @@ both paths share one display shader.
   into its half (W/2 × H/2 band, vertically letterboxed) — never squeezed, or
   free-viewing breaks; crossed order puts the RIGHT eye's view on the LEFT half
   for cross-eyed fusion; each eye rect gets a 1 px (resolution-scaled) green
-  border as a fusion anchor, and the canvas CSS size DOUBLES while stereo is on
-  (the eye rects are half-scale, so 2x display restores full apparent size; the
-  user chose CSS scaling over halving render resolution). `IPD` slider (0–0.5 world
+  border as a fusion anchor, and the canvas CSS size doubles in the two SBS
+  modes ONLY (their eye rects are half-scale; blend/anaglyph are full-frame
+  full-res and must NOT be CSS-scaled — shipped that bug once, looked low-res
+  and flickery). `IPD` slider (0–0.5 world
   units, default 0.12) and `FOV` slider (40–120°, applies in mono too — proj is
   rebuilt in main.js when it changes). Two independent star streams (starBufR /
   starMetaBufR, disjoint id ranges, separate birth RNG seed) each advected by
