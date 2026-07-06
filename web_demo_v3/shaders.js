@@ -1314,32 +1314,26 @@ fn luminance(c: vec3f) -> f32 {
         // + coverage alpha over black; field background is mono-only.
         var rgb = vec3f(0.0);
         if (disp.stereoMode <= 2u) {
-            // Side-by-side, ASPECT-CORRECT: each eye uniformly scaled by 1/2
-            // into its half (W/2 x H/2, vertically letterboxed) — squeezing to
-            // half width breaks free-viewing. Crossed order (mode 1) puts the
-            // RIGHT eye's view on the LEFT half for cross-eyed fusion;
-            // parallel order (mode 2) is the natural L|R.
-            let halfW = disp.W / 2u;
-            let rightHalf = col >= halfW;
-            let lc = select(col, col - halfW, rightHalf);
-            let vrow = i32(row) - i32(disp.H / 4u);
-            let bandH = disp.H / 2u;
-            if (vrow >= 0 && vrow < i32(bandH)) {
-                // Green frame around each eye's rectangle: a fusion anchor for
-                // free-viewing (thickness 1 px at 1024², resolution-scaled).
-                let bw = max(1u, disp.W / 1024u);
-                let onBorder = lc < bw || lc >= halfW - bw ||
-                               u32(vrow) < bw || u32(vrow) >= bandH - bw;
-                if (onBorder) {
-                    rgb = vec3f(0.0, 1.0, 0.0);
-                } else {
-                    let u = min(lc * 2u, disp.W - 1u);
-                    let v = min(u32(vrow) * 2u, disp.H - 1u);
-                    let useRightEye = select(rightHalf, !rightHalf, disp.stereoMode == 1u);
-                    let s = select(textureLoad(starTex,  vec2u(u, v), 0),
-                                   textureLoad(starTexR, vec2u(u, v), 0), useRightEye);
-                    rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
-                }
+            // TRUE side-by-side: the canvas itself is 2W wide in these modes
+            // (ui.updateCanvas), so each eye renders 1:1 at full resolution and
+            // full height — no downsample, no CSS stretch, retina-correct.
+            // Crossed order (mode 1) puts the RIGHT eye's view on the LEFT
+            // half for cross-eyed fusion; parallel (mode 2) is the natural L|R.
+            let cx = min(u32(uv.x * f32(2u * disp.W)), 2u * disp.W - 1u);
+            let rightHalf = cx >= disp.W;
+            let u = select(cx, cx - disp.W, rightHalf);
+            // Green frame around each eye's W x H rect: a fusion anchor for
+            // free-viewing (thickness 1 px at 1024², resolution-scaled).
+            let bw = max(1u, disp.W / 1024u);
+            let onBorder = u < bw || u >= disp.W - bw ||
+                           row < bw || row >= disp.H - bw;
+            if (onBorder) {
+                rgb = vec3f(0.0, 1.0, 0.0);
+            } else {
+                let useRightEye = select(rightHalf, !rightHalf, disp.stereoMode == 1u);
+                let s = select(textureLoad(starTex,  vec2u(u, row), 0),
+                               textureLoad(starTexR, vec2u(u, row), 0), useRightEye);
+                rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
             }
         } else {
             let sL = clamp(textureLoad(starTex,  vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));

@@ -280,3 +280,16 @@
   and flickery". Now SBS-only (modes 1-2). Lesson: the 2x exists BECAUSE SBS
   halves the eye scale; tie compensations to the thing they compensate for, not
   to the enclosing feature flag.
+
+## 2026-07-06: TRUE SBS (third attempt, user-driven)
+
+- v1: squeezed each eye 2:1 ("squashes the aspect ratio"). v2: letterboxed
+  half-scale render + 2x CSS stretch ("low res and flickery", "does not make
+  true retina display... u blew up the size by 2 when u don't need to").
+- v3 (correct): canvas backing store becomes 2W x H in the SBS modes; each eye
+  maps texel-for-texel at full W x H. No downsample, no CSS scaling; the retina
+  toggle now yields true 1:1 device pixels. LESSON: render at the size you
+  display — CSS scaling is never the fix for a resolution problem.
+- Mode switches (click + keyboard 1-7) now re-run updateCanvas so the 2W canvas
+  can't leak into non-Stars modes. Verified sizes across mono/SBS/blend/noise
+  round-trip; stereo suite green; sharp full-res screenshot confirmed.

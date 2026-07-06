@@ -268,14 +268,17 @@ both paths share one display shader.
     StarRenderUniforms 44 B (48 B buffer, sizeMaxPx at f32[10]). SETTINGS_VERSION 8.
 - **Stereo stars (added 2026-07-05; report §13 has the algorithm + proofs)**:
   `stereo` button cycles OFF / SBS-cross / SBS-parallel / blend / red-blue
-  (SETTINGS_VERSION 10). SBS is ASPECT-CORRECT: each eye uniformly scaled ×1/2
-  into its half (W/2 × H/2 band, vertically letterboxed) — never squeezed, or
-  free-viewing breaks; crossed order puts the RIGHT eye's view on the LEFT half
-  for cross-eyed fusion; each eye rect gets a 1 px (resolution-scaled) green
-  border as a fusion anchor, and the canvas CSS size doubles in the two SBS
-  modes ONLY (their eye rects are half-scale; blend/anaglyph are full-frame
-  full-res and must NOT be CSS-scaled — shipped that bug once, looked low-res
-  and flickery). `IPD` slider (0–0.5 world
+  (SETTINGS_VERSION 10). SBS is TRUE 1:1: in the two SBS modes (and Stars
+  display only) ui.updateCanvas makes the canvas BACKING STORE 2W×H and the
+  display shader maps each half to its eye texture texel-for-texel, full
+  height — no downsampling, no CSS stretching, retina-toggle-correct. (Two
+  shipped-and-fixed attempts first: squeezed 2:1 SBS, then render-at-half +
+  2x-CSS-stretch — "low res and flickery"; the lesson is render at the size
+  you display.) Crossed order puts the RIGHT eye's view on the LEFT half for
+  cross-eyed fusion; each eye rect gets a 1 px (resolution-scaled) green
+  border as a fusion anchor. Display-mode switches re-run updateCanvas (both
+  the click and keyboard paths) so leaving Stars restores the 1024 canvas.
+  `IPD` slider (0–0.5 world
   units, default 0.12) and `FOV` slider (40–120°, applies in mono too — proj is
   rebuilt in main.js when it changes). Two independent star streams (starBufR /
   starMetaBufR, disjoint id ranges, separate birth RNG seed) each advected by

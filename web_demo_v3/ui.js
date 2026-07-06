@@ -248,14 +248,16 @@ export class UIManager {
     updateCanvas(canvas) {
         const s = this.settings;
         const dpr = s.retina ? (window.devicePixelRatio || 1) : 1;
-        // SBS ONLY: those two modes render each eye at half scale side by
-        // side, so 2x display restores full apparent size. Blend/anaglyph are
-        // full-frame full-res — scaling them just looks low-res.
-        const css = (s.stereoMode === 1 || s.stereoMode === 2) ? 2 : 1;
-        canvas.width = this.W;
+        // TRUE SBS: in the two side-by-side stereo modes (Stars display only),
+        // the canvas BACKING STORE is 2W wide and each eye renders 1:1 at full
+        // resolution — never render-at-half-then-CSS-stretch (shipped that
+        // twice; it is blurry and defeats the retina toggle).
+        const sbs = this.displayMode === 6 && (s.stereoMode === 1 || s.stereoMode === 2);
+        const wMult = sbs ? 2 : 1;
+        canvas.width = this.W * wMult;
         canvas.height = this.H;
-        canvas.style.width = (this.W * css / dpr) + 'px';
-        canvas.style.height = (this.H * css / dpr) + 'px';
+        canvas.style.width = (this.W * wMult / dpr) + 'px';
+        canvas.style.height = (this.H / dpr) + 'px';
         canvas.style.imageRendering = s.bilinear ? 'auto' : 'pixelated';
     }
 
@@ -340,6 +342,7 @@ export class UIManager {
             btn.addEventListener('click', () => {
                 this.displayMode = parseInt(btn.dataset.mode);
                 this.syncUI();
+                this.callbacks.onRendererUpdate?.();   // canvas size depends on mode (SBS)
             });
         }
 
@@ -365,6 +368,7 @@ export class UIManager {
             if (e.code >= 'Digit1' && e.code <= 'Digit7') {
                 this.displayMode = parseInt(e.code.slice(5)) - 1;
                 this.syncUI();
+                this.callbacks.onRendererUpdate?.();   // canvas size depends on mode (SBS)
             }
             if (e.code === 'KeyB') this.blueNoiseBtn.click();
             if (e.code === 'KeyN') this.bnItersBtn.click();
