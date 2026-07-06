@@ -1380,7 +1380,9 @@ export class WebGPURenderer {
             srF32[7] = Math.max(6, Math.round(W / 1024 * GLYPH_HALF_BASE));
             srU32[8] = this.starColorQEnabled ? 1 : 0;
             srU32[9] = this.starSizeQEnabled ? 1 : 0;
-            srF32[10] = this.starSizeMaxPx;
+            // q-size slider is calibrated at 1024²: scale with resolution so a
+            // "20px" star looks the same size at 512² or 2048².
+            srF32[10] = this.starSizeMaxPx * (W / 1024);
             device.queue.writeBuffer(this.starRenderUniformBuf, 0, srBuf);
 
             // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
@@ -1596,6 +1598,7 @@ export class WebGPURenderer {
             // in stereo each should hover at ~numStars (merged-view uniformity)
             mergedL: counters ? Math.floor(counters[2] / 6) : null,
             mergedR: counters ? Math.floor(counters[3] / 6) : null,
+            stereoActive: this._stereoActive,
         };
         if (typeof window !== 'undefined') {
             window.__starStats = this.starStats;

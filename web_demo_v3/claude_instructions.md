@@ -248,7 +248,8 @@ both paths share one display shader.
     turboQ(q) — blue fresh, red near death. Ignored by emoji sprites.
   - **q-size** (`q-size` button + 0–20 px slider, settings `starSizeQ` /
     `starSizeMax`, default 8 px): size = REMAINING LIFE. A star's disc width =
-    starSizeMax · max(1 − q, SIZE_Q_MIN=0.15) texels: fresh stars (q ~ 0) at the
+    starSizeMax · (W/1024) · max(1 − q, SIZE_Q_MIN=0.15) texels (slider is
+    calibrated at 1024² and scales with resolution, like tent radius/glyphs): fresh stars (q ~ 0) at the
     slider's full width, SHRINKING as crowding erodes q toward death (user:
     "they should get smaller as they die"). Rendered as solid discs with a
     ~1 px antialiased rim — scaling the AA tent kernel instead shows the filter
@@ -266,7 +267,11 @@ both paths share one display shader.
   - StarUniforms back to 16 B {W, H, frameSeed, numStars};
     StarRenderUniforms 44 B (48 B buffer, sizeMaxPx at f32[10]). SETTINGS_VERSION 8.
 - **Stereo stars (added 2026-07-05; report §13 has the algorithm + proofs)**:
-  `stereo` button cycles OFF / SBS / blend / red-blue; `IPD` slider (0–0.5 world
+  `stereo` button cycles OFF / SBS-cross / SBS-parallel / blend / red-blue
+  (SETTINGS_VERSION 10). SBS is ASPECT-CORRECT: each eye uniformly scaled ×1/2
+  into its half (W/2 × H/2 band, vertically letterboxed) — never squeezed, or
+  free-viewing breaks; crossed order puts the RIGHT eye's view on the LEFT half
+  for cross-eyed fusion. `IPD` slider (0–0.5 world
   units, default 0.12) and `FOV` slider (40–120°, applies in mono too — proj is
   rebuilt in main.js when it changes). Two independent star streams (starBufR /
   starMetaBufR, disjoint id ranges, separate birth RNG seed) each advected by
@@ -280,7 +285,7 @@ both paths share one display shader.
   304 B with otherViewProj; mono sets otherViewProj = viewProj so cross ≡ 0;
   sky writes zero disparity). Field background is mono-only. Stats readback
   publishes __starStats.mergedL/R (each ≈ N by the merged-uniformity invariant
-  — the test asserts |merged/N − 1| < 6%). SETTINGS_VERSION 9.
+  — the test asserts |merged/N − 1| < 6%; also publishes stereoActive).
   Measured (test_stereo.mjs): mergedL/R within 0.3–1.7% of N across all modes,
   static + motion + IPD ∈ {0, 0.5}; mono path bit-identical stats after.
 - **Field background (added 2026-07-05)**: `field: OFF / E / deficit` button in the

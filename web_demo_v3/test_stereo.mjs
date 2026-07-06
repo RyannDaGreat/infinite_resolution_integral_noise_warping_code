@@ -19,6 +19,7 @@ const browser = await puppeteer.launch({
     args: ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--no-sandbox'],
 });
 const page = await browser.newPage();
+await page.setViewport({ width: 1100, height: 1300 });   // show the WHOLE canvas in screenshots
 const issues = [];
 page.on('console', m => {
     const t = m.text();
@@ -47,7 +48,7 @@ const check = (label, s) => {
         + `  ${okL && okR && okStream ? 'PASS' : 'FAIL'}`);
 };
 
-for (const [mode, name] of [[1, 'side-by-side'], [2, 'blend'], [3, 'red-blue']]) {
+for (const [mode, name] of [[1, 'sbs-crossed'], [2, 'sbs-parallel'], [3, 'blend'], [4, 'red-blue']]) {
     await page.click('#stereoBtn');                 // cycles OFF->SBS->blend->red-blue
     await sleep(2 * STATS_TICK_MS);
     check(`stereo ${name} (static)`, await stats());

@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 9;
+const SETTINGS_VERSION = 10;
 
 /**
  * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
@@ -54,7 +54,7 @@ const DEFAULTS = {
     starColorQ: false,  // tint stars by turbo(strength)
     starSizeQ: false,   // scale star footprint by strength
     starSizeMax: 8,     // q-size: full width in px of a q~1 star (0..20 slider)
-    stereoMode: 0,      // 0 off, 1 side-by-side, 2 blend, 3 red-blue anaglyph
+    stereoMode: 0,      // 0 off, 1 SBS crossed, 2 SBS parallel, 3 blend, 4 red-blue
     stereoIpd: 0.12,    // eye baseline, world units
     fovDeg: 70,         // camera field of view (mono + stereo)
 };
@@ -200,7 +200,7 @@ export class UIManager {
         this.starSizeQBtn.classList.toggle('on', s.starSizeQ);
         this.starSizeMaxSlider.value = s.starSizeMax;
         this.starSizeMaxLabel.textContent = `${s.starSizeMax}px`;
-        this.stereoBtn.textContent = `stereo: ${['OFF', 'SBS', 'blend', 'red-blue'][s.stereoMode]}`;
+        this.stereoBtn.textContent = `stereo: ${['OFF', 'SBS-cross', 'SBS-par', 'blend', 'red-blue'][s.stereoMode]}`;
         this.stereoBtn.classList.toggle('on', s.stereoMode !== 0);
         this.stereoIpdSlider.value = s.stereoIpd;
         this.stereoIpdLabel.textContent = s.stereoIpd.toFixed(2);
@@ -312,7 +312,7 @@ export class UIManager {
             s.starSizeMax = parseFloat(this.starSizeMaxSlider.value); update();
         });
         this.stereoBtn.addEventListener('click', () => {
-            s.stereoMode = (s.stereoMode + 1) % 4; update();
+            s.stereoMode = (s.stereoMode + 1) % 5; update();
         });
         this.stereoIpdSlider.addEventListener('input', () => {
             s.stereoIpd = parseFloat(this.stereoIpdSlider.value); update();

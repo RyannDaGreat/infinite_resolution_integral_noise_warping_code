@@ -250,3 +250,19 @@
   mono unaffected (headless + 1M-star motion tests pass unchanged). Anaglyph
   screenshot shows red/blue disparity pairs (same identity in both eyes — the
   shared-q coupling from the Python tests, 93.7% shared ids there).
+
+## 2026-07-05: SBS aspect fix (user: "sbs squashes the aspect ratio")
+
+- First SBS squeezed each eye 2:1 into its half — unusable for free-viewing.
+  Now aspect-correct: each eye uniformly scaled x1/2 into a letterboxed W/2 x H/2
+  band, and split into SBS-cross (right eye on the left half — for crossed-eye
+  fusion, what the user wanted) and SBS-parallel. Mode cycle is now 5 states;
+  SETTINGS_VERSION 10.
+- Debugging detour worth recording: the "missing letterbox" was a MISREAD — the
+  800x600 test viewport clipped the 1024^2 canvas to its top 40%, hiding the
+  bars. Verified with a 1100x1300 viewport + a temporary per-frame uniform log
+  (disp stereo=1 reaching the GPU). Lesson: screenshot the WHOLE canvas before
+  diagnosing a display-shader branch; test screenshots now use a tall viewport.
+- q-size slider now resolution-relative (user: "if resolution is 2x as large so
+  should the size be"): effective width = slider * (W/1024). Same class of fix as
+  the graveyard bucket lesson: pixel-denominated parameters must scale with W.

@@ -1190,7 +1190,7 @@ struct DisplayUniforms {
     thresholdValue: f32,
     noiseOpacity:   f32,
     starField:      u32,   // Stars-mode background: 0 off, 1 density E, 2 deficit
-    stereoMode:     u32,   // 0 off, 1 side-by-side, 2 blend, 3 red-blue anaglyph
+    stereoMode:     u32,   // 0 off, 1 SBS crossed, 2 SBS parallel, 3 blend, 4 red-blue
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
 
@@ -1312,20 +1312,29 @@ fn luminance(c: vec3f) -> f32 {
     if (disp.mode == 6u && disp.stereoMode != 0u) {
         // Stereo composites. Each eye's starTex carries premultiplied star rgb
         // + coverage alpha over black; field background is mono-only.
-        var rgb: vec3f;
-        if (disp.stereoMode == 1u) {
-            // side-by-side: each eye squeezed to half width
-            if (col < disp.W / 2u) {
-                let s = textureLoad(starTex, vec2u(min(col * 2u, disp.W - 1u), row), 0);
-                rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
-            } else {
-                let s = textureLoad(starTexR, vec2u(min((col - disp.W / 2u) * 2u, disp.W - 1u), row), 0);
+        var rgb = vec3f(0.0);
+        if (disp.stereoMode <= 2u) {
+            // Side-by-side, ASPECT-CORRECT: each eye uniformly scaled by 1/2
+            // into its half (W/2 x H/2, vertically letterboxed) — squeezing to
+            // half width breaks free-viewing. Crossed order (mode 1) puts the
+            // RIGHT eye's view on the LEFT half for cross-eyed fusion;
+            // parallel order (mode 2) is the natural L|R.
+            let halfW = disp.W / 2u;
+            let rightHalf = col >= halfW;
+            let lc = select(col, col - halfW, rightHalf);
+            let vrow = i32(row) - i32(disp.H / 4u);
+            if (vrow >= 0 && vrow < i32(disp.H / 2u)) {
+                let u = min(lc * 2u, disp.W - 1u);
+                let v = min(u32(vrow) * 2u, disp.H - 1u);
+                let useRightEye = select(rightHalf, !rightHalf, disp.stereoMode == 1u);
+                let s = select(textureLoad(starTex,  vec2u(u, v), 0),
+                               textureLoad(starTexR, vec2u(u, v), 0), useRightEye);
                 rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
             }
         } else {
             let sL = clamp(textureLoad(starTex,  vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));
             let sR = clamp(textureLoad(starTexR, vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));
-            if (disp.stereoMode == 2u) {
+            if (disp.stereoMode == 3u) {
                 rgb = 0.5 * (sL + sR);                   // 50% blend
             } else {
                 rgb = vec3f(sL.r, 0.0, sR.b);            // red-blue glasses: red of L, blue of R
