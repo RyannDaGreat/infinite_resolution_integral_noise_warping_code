@@ -192,6 +192,7 @@ export class WebGPURenderer {
         this.starSizeQEnabled = false;   // scale star footprint by strength
         this.starSizeMaxPx = 8;          // q-size mode: full width of a q~1 star
         this._stereoActive = false;      // stars mode + stereo enabled this frame
+        this.stereoSwapEnabled = false;  // anaglyph: swap which eye is red vs blue
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -1151,6 +1152,7 @@ export class WebGPURenderer {
         const stereoNow = displayMode === STARS_MODE && !!stereo && stereo.mode > 0;
         dispU32[7] = stereoNow ? 0 : this.starFieldView;  // field bg is mono-only
         dispU32[8] = stereoNow ? stereo.mode : 0;
+        dispU32[9] = this.stereoSwapEnabled ? 1 : 0;
         device.queue.writeBuffer(this.displayUniformBuf, 0, dispBuf);
 
         const encoder = device.createCommandEncoder();

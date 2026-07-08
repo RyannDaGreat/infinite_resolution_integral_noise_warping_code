@@ -1191,6 +1191,7 @@ struct DisplayUniforms {
     noiseOpacity:   f32,
     starField:      u32,   // Stars-mode background: 0 off, 1 density E, 2 deficit
     stereoMode:     u32,   // 0 off, 1 SBS crossed, 2 SBS parallel, 3 blend, 4 red-blue
+    stereoSwap:     u32,   // red-blue mode: 1 = swap which eye gets red vs blue
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
 
@@ -1341,7 +1342,10 @@ fn luminance(c: vec3f) -> f32 {
             if (disp.stereoMode == 3u) {
                 rgb = 0.5 * (sL + sR);                   // 50% blend
             } else {
-                rgb = vec3f(sL.r, 0.0, sR.b);            // red-blue glasses: red of L, blue of R
+                // red-blue glasses: red eye gets red channel, blue eye blue.
+                // Swap flips the assignment for glasses worn the other way.
+                rgb = select(vec3f(sL.r, 0.0, sR.b),
+                             vec3f(sR.r, 0.0, sL.b), disp.stereoSwap == 1u);
             }
         }
         return vec4f(srgbEncode(rgb.r), srgbEncode(rgb.g), srgbEncode(rgb.b), 1.0);

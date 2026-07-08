@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 10;
+const SETTINGS_VERSION = 11;
 
 /**
  * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
@@ -56,6 +56,7 @@ const DEFAULTS = {
     starSizeMax: 8,     // q-size: full width in px of a q~1 star (0..20 slider)
     stereoMode: 0,      // 0 off, 1 SBS crossed, 2 SBS parallel, 3 blend, 4 red-blue
     stereoIpd: 0.12,    // eye baseline, world units
+    stereoSwap: false,  // anaglyph: swap which eye gets red vs blue
     fovDeg: 70,         // camera field of view (mono + stereo)
 };
 
@@ -108,6 +109,7 @@ export class UIManager {
         this.starSizeMaxSlider = document.getElementById('starSizeMaxSlider');
         this.starSizeMaxLabel = document.getElementById('starSizeMaxLabel');
         this.stereoBtn = document.getElementById('stereoBtn');
+        this.stereoSwapBtn = document.getElementById('stereoSwapBtn');
         this.stereoIpdSlider = document.getElementById('stereoIpdSlider');
         this.stereoIpdLabel = document.getElementById('stereoIpdLabel');
         this.fovSlider = document.getElementById('fovSlider');
@@ -202,6 +204,8 @@ export class UIManager {
         this.starSizeMaxLabel.textContent = `${s.starSizeMax}px`;
         this.stereoBtn.textContent = `stereo: ${['OFF', 'SBS-cross', 'SBS-par', 'blend', 'red-blue'][s.stereoMode]}`;
         this.stereoBtn.classList.toggle('on', s.stereoMode !== 0);
+        this.stereoSwapBtn.textContent = `swap R/B: ${s.stereoSwap ? 'ON' : 'OFF'}`;
+        this.stereoSwapBtn.classList.toggle('on', s.stereoSwap);
         this.stereoIpdSlider.value = s.stereoIpd;
         this.stereoIpdLabel.textContent = s.stereoIpd.toFixed(2);
         this.fovSlider.value = s.fovDeg;
@@ -238,6 +242,7 @@ export class UIManager {
         renderer.starColorQEnabled = s.starColorQ;
         renderer.starSizeQEnabled = s.starSizeQ;
         renderer.starSizeMaxPx = s.starSizeMax;
+        renderer.stereoSwapEnabled = s.stereoSwap;
         // stereo camera params are consumed by main.js each frame (matrix build)
     }
 
@@ -320,6 +325,7 @@ export class UIManager {
         this.stereoBtn.addEventListener('click', () => {
             s.stereoMode = (s.stereoMode + 1) % 5; update();
         });
+        this.stereoSwapBtn.addEventListener('click', () => { s.stereoSwap = !s.stereoSwap; update(); });
         this.stereoIpdSlider.addEventListener('input', () => {
             s.stereoIpd = parseFloat(this.stereoIpdSlider.value); update();
         });

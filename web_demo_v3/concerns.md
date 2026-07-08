@@ -293,3 +293,10 @@
 - Mode switches (click + keyboard 1-7) now re-run updateCanvas so the 2W canvas
   can't leak into non-Stars modes. Verified sizes across mono/SBS/blend/noise
   round-trip; stereo suite green; sharp full-res screenshot confirmed.
+
+## 2026-07-08: anaglyph swap toggle
+
+- `swap R/B` button (user: "idk how they gonna wear the glasses"): flips the
+  eye-to-channel assignment in red-blue mode via DisplayUniforms.stereoSwap.
+  SETTINGS_VERSION 11. Verified both orientations render, zero GPU issues,
+  stereo suite green.

@@ -278,7 +278,9 @@ both paths share one display shader.
   cross-eyed fusion; each eye rect gets a 1 px (resolution-scaled) green
   border as a fusion anchor. Display-mode switches re-run updateCanvas (both
   the click and keyboard paths) so leaving Stars restores the 1024 canvas.
-  `IPD` slider (0–0.5 world
+  A `swap R/B` toggle flips which eye gets the red vs blue channel in
+  anaglyph mode (glasses get worn both ways; setting `stereoSwap`,
+  SETTINGS_VERSION 11). `IPD` slider (0–0.5 world
   units, default 0.12) and `FOV` slider (40–120°, applies in mono too — proj is
   rebuilt in main.js when it changes). Two independent star streams (starBufR /
   starMetaBufR, disjoint id ranges, separate birth RNG seed) each advected by
