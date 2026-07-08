@@ -315,3 +315,22 @@
   98.0% shared at default IPD, 100.0% at IPD=0 (must be exact — and it is; this
   doubles as a machinery correctness check), 93.0% at IPD=0.5. Suite asserts
   shared > 50% and all prior invariants; all green, mono untouched.
+
+## 2026-07-08: "cull orphans appears to do nothing" — user right, two-layer debug
+
+- Semantics confirmed with user: if a star died in EITHER eye's final merge, it
+  must vanish from BOTH ("if one was deathed then the other has to be too").
+- BUG: growing StarRenderUniforms to 64 B updated the GPU buffer but NOT the
+  CPU staging ArrayBuffer(48) — srU32[12] (cullOrphans) was an OUT-OF-BOUNDS
+  typed-array write, which is SILENT in JS. eyeBit at index 11 just barely fit,
+  masking the problem. LESSON: grow GPU buffer + CPU staging TOGETHER (the
+  staging now carries a comment); silent OOB writes make this class invisible —
+  probe uniforms live (console log of staged values) when a flag "does nothing".
+- Debug detours worth keeping: (1) element screenshots include overlapping DOM —
+  the GPU-timing overlay text polluted pixel diffs until the changed-pixel BBOX
+  (y 25..49 only!) exposed it; diff below y=60 or hide overlays. (2) `npm i
+  --no-save <pkg>` in a dir without package.json PRUNES existing node_modules
+  (deleted puppeteer mid-session).
+- Definitive A/B under noise lock, text strip masked: cull ON = 5092 star px
+  removed, 0 added (pure subset, ~850 orphans at IPD 0.5); OFF = 0/0 perfect
+  revert. Suite green incl. the cull check; mono untouched.

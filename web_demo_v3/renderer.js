@@ -1369,7 +1369,7 @@ export class WebGPURenderer {
             // resolution so stars stay visible at 2048².
             const tentRadius = Math.max(1, Math.round(W / 1024));
             const hardHalf = Math.max(0.5, W / 2048);
-            const srBuf = new ArrayBuffer(48);
+            const srBuf = new ArrayBuffer(64);   // MUST cover every srU32/srF32 index below
             const srU32 = new Uint32Array(srBuf);
             const srF32 = new Float32Array(srBuf);
             srU32[0] = W; srU32[1] = H;
@@ -1390,6 +1390,7 @@ export class WebGPURenderer {
                 srU32[11] = 2;                                       // eyeBit: right
                 device.queue.writeBuffer(this.starRenderUniformBufR, 0, srBuf);
             }
+
 
             // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
             const encodeStarStep = (splatGroup, updateGroup) => {
