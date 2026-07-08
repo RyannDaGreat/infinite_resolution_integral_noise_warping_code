@@ -114,6 +114,7 @@
             <span class="sep">|</span>
             <button id="stereoBtn" title="Stereo stars: two eye cameras, two independent star streams, merged per eye at render time (report §13). Cycles OFF / SBS crossed (cross your eyes; aspect-correct, letterboxed) / SBS parallel / 50% blend / red-blue anaglyph">stereo: OFF</button>
             <button id="stereoSwapBtn" title="Red-blue mode: swap which eye gets the red vs blue channel — depends on how the glasses are worn">swap R/B: OFF</button>
+            <button id="cullOrphansBtn" title="Hide orphan stars — stars visible in only one eye's merged view (kills binocular-rivalry sparkle; only stars both eyes agree on remain)">Cull Orphans: OFF</button>
             <span style="font-size:11px;">IPD:</span>
             <input type="range" id="stereoIpdSlider" min="0" max="0.5" step="0.01" value="0.12" title="Stereo camera baseline (world units)" style="width:60px; vertical-align:middle; accent-color:#48c;">
             <span id="stereoIpdLabel" style="font-size:11px; min-width:30px; display:inline-block;">0.12</span>

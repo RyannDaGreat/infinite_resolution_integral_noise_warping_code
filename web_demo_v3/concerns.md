@@ -300,3 +300,18 @@
   eye-to-channel assignment in red-blue mode via DisplayUniforms.stereoSwap.
   SETTINGS_VERSION 11. Verified both orientations render, zero GPU issues,
   stereo suite green.
+
+## 2026-07-08: Cull Orphans (user feature) + merge-path refactor
+
+- User: hide "orphan stars" not shared between both views (default off). Button
+  label per user: "Cull Orphans".
+- Key insight: both merges enumerate the SAME 2N candidates -> a canonical index
+  makes "shared" a 2-bit mask, no id set-intersection needed. mergeSelect became
+  candidate-indexed (writes at [canon], sets eye bit); render draws fixed 2N
+  quads and degenerates by mask. drawIndirect compaction retired — which also
+  freed a binding, keeping mergeSelect at exactly 8 storage buffers (the limit
+  that black-screened us once).
+- Shared-count diagnostic came free (second merge pass counts atomicOr priors):
+  98.0% shared at default IPD, 100.0% at IPD=0 (must be exact — and it is; this
+  doubles as a machinery correctness check), 93.0% at IPD=0.5. Suite asserts
+  shared > 50% and all prior invariants; all green, mono untouched.

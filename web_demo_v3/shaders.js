@@ -1721,6 +1721,10 @@ struct StarUniforms {
     H:         u32,
     frameSeed: u32,
     numStars:  u32,
+    flags:     u32,   // bit 0: this merge's OWN stream is the right eye
+    _pad0:     u32,
+    _pad1:     u32,
+    _pad2:     u32,
 }
 
 // Per-star metadata: strength q (eroded by crowding, dies at 1) + identity.
@@ -1962,6 +1966,22 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 // q's make both eyes' merges common-random-numbers coupled (see report §13).
 // Survivors are appended to a compact list consumed via drawIndirect.
 // ---------------------------------------------------------------------------
+// Stereo merge select (one per eye per frame): the kept half of the user's
+// hcat warp step, with the provably-dead birth stage skipped. Threads 0..N-1
+// are OWN-stream stars (zero flow); threads N..2N-1 are OTHER-stream stars
+// advected by the cross-eye flow. Survival is the deterministic v3 threshold
+// q * E < 1 with E = 1 (own half's exact zero-flow self-splat) + the OTHER
+// view's transported density (splatted by starSplat into `density` from the
+// cross texture). Copies only — the per-eye streams are never mutated; shared
+// q's make both eyes' merges common-random-numbers coupled (see report §13).
+//
+// Outputs are CANDIDATE-INDEXED (canon id = L-star j -> j, R-star j -> N+j;
+// both eyes agree). Each eye writes its landing position/meta at [canon] and
+// sets its bit in the shared mask; the render pass draws 2N quads and skips
+// unset (or, in shared-only mode, non-both-eyes) candidates. mask tail:
+// [2N] = left survivor count, [2N+1] = right, [2N+2] = shared (counted by the
+// second merge pass via atomicOr's returned prior bits).
+// ---------------------------------------------------------------------------
 export const mergeSelectWGSL = /* wgsl */`
 ${starCommonWGSL}
 
@@ -1974,8 +1994,7 @@ ${starCommonWGSL}
 @group(0) @binding(6) var<storage, read> otherMeta: array<StarMeta>;
 @group(0) @binding(7) var<storage, read_write> mergedPos:  array<f32>;
 @group(0) @binding(8) var<storage, read_write> mergedMeta: array<StarMeta>;
-// drawIndirect args: [vertexCount, instanceCount=1, firstVertex, firstInstance]
-@group(0) @binding(9) var<storage, read_write> indirect: array<atomic<u32>>;
+@group(0) @binding(9) var<storage, read_write> mask: array<atomic<u32>>;
 
 fn sampleCross(p: vec2f) -> vec2f {
     let maxIdx = vec2f(f32(u.W) - 1.0, f32(u.H) - 1.0);
@@ -2006,15 +2025,18 @@ fn sampleDensity(p: vec2f) -> f32 {
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
-    if (i >= 2u * u.numStars) { return; }
+    let n = u.numStars;
+    if (i >= 2u * n) { return; }
+    let ownIsRight = (u.flags & 1u) != 0u;
+    let canon = select(i, (i + n) % (2u * n), ownIsRight);
 
     var pos: vec2f;
     var m: StarMeta;
-    if (i < u.numStars) {
+    if (i < n) {
         pos = vec2f(ownPos[i * 2u], ownPos[i * 2u + 1u]);   // own half: zero flow
         m = ownMeta[i];
     } else {
-        let j = i - u.numStars;
+        let j = i - n;
         var p = vec2f(otherPos[j * 2u], otherPos[j * 2u + 1u]);
         let f = sampleCross(p);
         pos = p + vec2f(f.x * f32(u.W), -f.y * f32(u.H));   // reproject into this eye
@@ -2027,11 +2049,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let E = 1.0 + max(sampleDensity(pos), 0.0);
     if (m.q * E >= 1.0) { return; }                          // deterministic thin to uniform
 
-    let v = atomicAdd(&indirect[0], 6u);                     // 6 vertices per star quad
-    let slot = v / 6u;
-    mergedPos[slot * 2u]      = pos.x;
-    mergedPos[slot * 2u + 1u] = pos.y;
-    mergedMeta[slot] = m;
+    mergedPos[canon * 2u]      = pos.x;
+    mergedPos[canon * 2u + 1u] = pos.y;
+    mergedMeta[canon] = m;
+    let eyeBit = select(1u, 2u, ownIsRight);
+    let prior = atomicOr(&mask[canon], eyeBit);
+    atomicAdd(&mask[2u * n + select(0u, 1u, ownIsRight)], 1u);
+    if ((prior | eyeBit) == 3u) {                            // both eyes now: shared
+        atomicAdd(&mask[2u * n + 2u], 1u);
+    }
 }
 `;
 
@@ -2053,6 +2079,8 @@ struct StarRenderUniforms {
     colorQ:    u32,   // 1: tint tents by turbo(q) — blue fresh, red near death
     sizeQ:     u32,   // 1: scale every star's footprint by its strength q
     sizeMaxPx: f32,   // q-size mode: full width in texels of a q~1 star (slider, 0..20)
+    eyeBit:    u32,   // stereo merged render: 1 = left eye, 2 = right; 0 = mono (no mask)
+    cullOrphans: u32, // 1: skip stars not visible in BOTH eyes (mask != 3)
 }
 
 // Smallest footprint scale in q-size mode: a newborn (q ~ 0) star must still
@@ -2081,6 +2109,9 @@ fn turboQ(t: f32) -> vec3f {
 @group(0) @binding(2) var<storage, read> starMeta: array<StarMeta>;
 @group(0) @binding(3) var atlasTex: texture_2d<f32>;
 @group(0) @binding(4) var atlasSamp: sampler;
+// Stereo merged rendering: per-candidate eye-visibility bits (1 = L, 2 = R)
+// written by mergeSelect; mono renders bind it too but never read (eyeBit 0).
+@group(0) @binding(5) var<storage, read> eyeMask: array<u32>;
 
 const ATLAS_GRID = 8u;      // 8x8 glyph cells in the atlas
 const ATLAS_GLYPHS = 61u;   // populated cells (rest are empty)
@@ -2097,7 +2128,14 @@ struct VsOut {
     let star = vid / 6u;
     let corner = vid % 6u;
     var out: VsOut;
-    if (star >= u.numStars) {
+    var skip = star >= u.numStars;
+    if (!skip && u.eyeBit != 0u) {
+        // Merged stereo buffers are candidate-indexed: draw only candidates
+        // this eye saw — and in Cull Orphans mode, only those BOTH eyes see.
+        let m = eyeMask[star];
+        skip = (m & u.eyeBit) == 0u || (u.cullOrphans == 1u && (m & 3u) != 3u);
+    }
+    if (skip) {
         out.position = vec4f(2.0, 2.0, 0.0, 1.0);  // degenerate, off-screen
         out.starPos = vec2f(0.0);
         out.uv = vec2f(0.0);

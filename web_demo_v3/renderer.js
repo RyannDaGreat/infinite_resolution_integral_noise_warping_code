@@ -193,6 +193,7 @@ export class WebGPURenderer {
         this.starSizeMaxPx = 8;          // q-size mode: full width of a q~1 star
         this._stereoActive = false;      // stars mode + stereo enabled this frame
         this.stereoSwapEnabled = false;  // anaglyph: swap which eye is red vs blue
+        this.cullOrphansEnabled = false; // stereo: hide stars not visible in BOTH eyes
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -255,7 +256,7 @@ export class WebGPURenderer {
             this.starBuf, this.starMetaBuf, this.starCountersBuf,
             this.starBufR, this.starMetaBufR, this.starUniformBufR, this.cameraUniformBufR,
             this.mergedPosL, this.mergedMetaL, this.mergedPosR, this.mergedMetaR,
-            this.mergeIndirectL, this.mergeIndirectR,
+            this.mergeMaskBuf, this.starRenderUniformBufR,
             this.starRowCdfBuf, this.starUniformBuf, this.starRenderUniformBuf, this._starStagingBuf,
             this.starDensityBuf, this.starRowPrefixBuf,
             this.boxVB, this.sphereVB, this.quadVB, this.terrainVB,
@@ -427,15 +428,10 @@ export class WebGPURenderer {
         this.mergedMetaL = storage(2 * MAX_STARS * 2 * f4);
         this.mergedPosR  = storage(2 * MAX_STARS * 2 * f4);
         this.mergedMetaR = storage(2 * MAX_STARS * 2 * f4);
-        // drawIndirect args per eye: [vertexCount, 1, 0, 0]; vertexCount grows atomically.
-        this.mergeIndirectL = device.createBuffer({
-            size: 16, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE |
-                             GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-        });
-        this.mergeIndirectR = device.createBuffer({
-            size: 16, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE |
-                             GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-        });
+        // Per-candidate eye-visibility bits (1 = seen by L merge, 2 = by R) +
+        // tail counters [2N]=L survivors, [2N+1]=R, [2N+2]=shared-by-both.
+        this.mergeMaskBuf = storage((2 * MAX_STARS + 4) * f4,
+            GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
         this.starDensityBuf   = storage(N * f4, GPUBufferUsage.COPY_DST);  // E (CAS-atomic f32)
         this.starRowPrefixBuf = storage(N * f4);       // per-row deficit prefix sums
         this.starRowCdfBuf    = storage(this.H * f4);  // row CDF; last entry = total deficit
@@ -446,7 +442,10 @@ export class WebGPURenderer {
             size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.starRenderUniformBuf = device.createBuffer({
-            size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.starRenderUniformBufR = device.createBuffer({   // right merged render: eyeBit 2
+            size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         // Layout: [0, SS*8) positions, [SS*8, SS*16) meta {q,id}, [SS*16, +16) counters.
         this._starStagingBuf = device.createBuffer({
@@ -741,11 +740,11 @@ export class WebGPURenderer {
         });
         // Stereo merge select: own stream + other stream reprojected by the
         // cross flow, thinned against 1 + transported density (see shader).
-        const mergeGroup = (crossView, ownPos, ownMeta, otherPos, otherMeta, mergedPos, mergedMeta, indirect) =>
+        const mergeGroup = (uniformBuf, crossView, ownPos, ownMeta, otherPos, otherMeta, mergedPos, mergedMeta) =>
             device.createBindGroup({
                 layout: this.mergeSelectPipeline.getBindGroupLayout(0),
                 entries: [
-                    { binding: 0, resource: buf(this.starUniformBuf) },
+                    { binding: 0, resource: buf(uniformBuf) },   // flags bit0 = own is right eye
                     { binding: 1, resource: crossView },
                     { binding: 2, resource: buf(this.starDensityBuf) },
                     { binding: 3, resource: buf(ownPos) },
@@ -754,15 +753,15 @@ export class WebGPURenderer {
                     { binding: 6, resource: buf(otherMeta) },
                     { binding: 7, resource: buf(mergedPos) },
                     { binding: 8, resource: buf(mergedMeta) },
-                    { binding: 9, resource: buf(indirect) },
+                    { binding: 9, resource: buf(this.mergeMaskBuf) },
                 ],
             });
-        this.mergeSelectBindGroupL = mergeGroup(this.crossTexRView,
+        this.mergeSelectBindGroupL = mergeGroup(this.starUniformBuf, this.crossTexRView,
             this.starBuf, this.starMetaBuf, this.starBufR, this.starMetaBufR,
-            this.mergedPosL, this.mergedMetaL, this.mergeIndirectL);
-        this.mergeSelectBindGroupR = mergeGroup(this.crossTexLView,
+            this.mergedPosL, this.mergedMetaL);
+        this.mergeSelectBindGroupR = mergeGroup(this.starUniformBufR, this.crossTexLView,
             this.starBufR, this.starMetaBufR, this.starBuf, this.starMetaBuf,
-            this.mergedPosR, this.mergedMetaR, this.mergeIndirectR);
+            this.mergedPosR, this.mergedMetaR);
         // Same entries for both render pipelines ('auto' layouts are per-pipeline).
         const starRenderEntries = () => [
             { binding: 0, resource: buf(this.starRenderUniformBuf) },
@@ -770,6 +769,7 @@ export class WebGPURenderer {
             { binding: 2, resource: buf(this.starMetaBuf) },
             { binding: 3, resource: this.atlasTexView },
             { binding: 4, resource: this.atlasSampler },
+            { binding: 5, resource: buf(this.mergeMaskBuf) },   // unread in mono (eyeBit 0)
         ];
         this.starRenderBindGroup = device.createBindGroup({
             layout: this.starRenderPipeline.getBindGroupLayout(0),
@@ -779,24 +779,26 @@ export class WebGPURenderer {
             layout: this.starRenderPipelineEmoji.getBindGroupLayout(0),
             entries: starRenderEntries(),
         });
-        const mergedRenderEntries = (posBuf, metaBuf) => [
-            { binding: 0, resource: buf(this.starRenderUniformBuf) },
+        const mergedRenderEntries = (uniformBuf, posBuf, metaBuf) => [
+            { binding: 0, resource: buf(uniformBuf) },
             { binding: 1, resource: buf(posBuf) },
             { binding: 2, resource: buf(metaBuf) },
             { binding: 3, resource: this.atlasTexView },
             { binding: 4, resource: this.atlasSampler },
+            { binding: 5, resource: buf(this.mergeMaskBuf) },
         ];
         this.mergedRenderBG = {};   // [eye][emoji 0|1] -> bind group
-        for (const [eye, posBuf, metaBuf] of [['L', this.mergedPosL, this.mergedMetaL],
-                                              ['R', this.mergedPosR, this.mergedMetaR]]) {
+        for (const [eye, uniformBuf, posBuf, metaBuf] of
+                 [['L', this.starRenderUniformBuf,  this.mergedPosL, this.mergedMetaL],
+                  ['R', this.starRenderUniformBufR, this.mergedPosR, this.mergedMetaR]]) {
             this.mergedRenderBG[eye] = [
                 device.createBindGroup({
                     layout: this.starRenderPipeline.getBindGroupLayout(0),
-                    entries: mergedRenderEntries(posBuf, metaBuf),
+                    entries: mergedRenderEntries(uniformBuf, posBuf, metaBuf),
                 }),
                 device.createBindGroup({
                     layout: this.starRenderPipelineEmoji.getBindGroupLayout(0),
-                    entries: mergedRenderEntries(posBuf, metaBuf),
+                    entries: mergedRenderEntries(uniformBuf, posBuf, metaBuf),
                 }),
             ];
         }
@@ -1353,17 +1355,13 @@ export class WebGPURenderer {
         // --- Star warp (Stars display mode only) ---
         if (starsMode) {
             device.queue.writeBuffer(this.starUniformBuf, 0,
-                new Uint32Array([W, H, frameSeed, numStars]));
+                new Uint32Array([W, H, frameSeed, numStars, 0, 0, 0, 0]));
             if (stereoActive) {
-                // Independent RNG stream for the right eye's births.
+                // Independent RNG stream for the right eye's births; flags bit 0
+                // marks its merge's OWN stream as the right eye (canon indexing).
                 const seedR = (Math.imul(frameSeed, 2654435761) ^ 0x9e3779b9) >>> 0;
                 device.queue.writeBuffer(this.starUniformBufR, 0,
-                    new Uint32Array([W, H, seedR, numStars]));
-                if (!this.noiseLocked) {
-                    // drawIndirect args reset: [vertexCount, instanceCount, 0, 0]
-                    device.queue.writeBuffer(this.mergeIndirectL, 0, new Uint32Array([0, 1, 0, 0]));
-                    device.queue.writeBuffer(this.mergeIndirectR, 0, new Uint32Array([0, 1, 0, 0]));
-                }
+                    new Uint32Array([W, H, seedR, numStars, 1, 0, 0, 0]));
             }
 
             // Render uniform: tent radius (integer for exact partition-of-unity
@@ -1385,7 +1383,13 @@ export class WebGPURenderer {
             // q-size slider is calibrated at 1024²: scale with resolution so a
             // "20px" star looks the same size at 512² or 2048².
             srF32[10] = this.starSizeMaxPx * (W / 1024);
+            srU32[11] = stereoActive ? 1 : 0;                        // eyeBit: left
+            srU32[12] = stereoActive && this.cullOrphansEnabled ? 1 : 0;
             device.queue.writeBuffer(this.starRenderUniformBuf, 0, srBuf);
+            if (stereoActive) {
+                srU32[11] = 2;                                       // eyeBit: right
+                device.queue.writeBuffer(this.starRenderUniformBufR, 0, srBuf);
+            }
 
             // Lock [L] freezes the star field too: skip the dynamics, keep rendering.
             const encodeStarStep = (splatGroup, updateGroup) => {
@@ -1436,6 +1440,7 @@ export class WebGPURenderer {
                 encodeStarStep(this.starSplatBindGroup, this.starUpdateBindGroup);
                 if (stereoActive) {
                     encodeStarStep(this.starSplatBindGroupR, this.starUpdateBindGroupR);
+                    encoder.clearBuffer(this.mergeMaskBuf);   // visibility bits + counters
                     encodeMerge(this.mergeSplatBindGroupL, this.mergeSelectBindGroupL);
                     encodeMerge(this.mergeSplatBindGroupR, this.mergeSelectBindGroupR);
                 }
@@ -1445,7 +1450,7 @@ export class WebGPURenderer {
             const emojiIdx = this.starEmojiEnabled ? 1 : 0;
             const pipeline = this.starEmojiEnabled ? this.starRenderPipelineEmoji
                                                    : this.starRenderPipeline;
-            const encodeStarRender = (texView, bindGroup, indirectBuf) => {
+            const encodeStarRender = (texView, bindGroup, quadCount) => {
                 const starPass = encoder.beginRenderPass({
                     colorAttachments: [{
                         view: texView,
@@ -1454,17 +1459,16 @@ export class WebGPURenderer {
                 });
                 starPass.setPipeline(pipeline);
                 starPass.setBindGroup(0, bindGroup);
-                if (indirectBuf) starPass.drawIndirect(indirectBuf, 0);
-                else starPass.draw(numStars * 6);
+                starPass.draw(quadCount * 6);   // vs degenerates unset/orphan candidates
                 starPass.end();
             };
             if (stereoActive) {
-                encodeStarRender(this.starTexView,  this.mergedRenderBG.L[emojiIdx], this.mergeIndirectL);
-                encodeStarRender(this.starTexRView, this.mergedRenderBG.R[emojiIdx], this.mergeIndirectR);
+                encodeStarRender(this.starTexView,  this.mergedRenderBG.L[emojiIdx], 2 * numStars);
+                encodeStarRender(this.starTexRView, this.mergedRenderBG.R[emojiIdx], 2 * numStars);
             } else {
                 encodeStarRender(this.starTexView,
                     this.starEmojiEnabled ? this.starRenderBindGroupEmoji : this.starRenderBindGroup,
-                    null);
+                    numStars);
             }
         }
 
@@ -1513,10 +1517,8 @@ export class WebGPURenderer {
                 this._starStagingBuf, STAR_STATS_SAMPLE * 8, starSample * 2 * 4);
             encoder.copyBufferToBuffer(this.starCountersBuf, 0,
                 this._starStagingBuf, STAR_STATS_SAMPLE * 16, 8);
-            encoder.copyBufferToBuffer(this.mergeIndirectL, 0,
-                this._starStagingBuf, STAR_STATS_SAMPLE * 16 + 8, 4);
-            encoder.copyBufferToBuffer(this.mergeIndirectR, 0,
-                this._starStagingBuf, STAR_STATS_SAMPLE * 16 + 12, 4);
+            encoder.copyBufferToBuffer(this.mergeMaskBuf, 2 * numStars * 4,
+                this._starStagingBuf, STAR_STATS_SAMPLE * 16 + 8, 12);
             this._starStatsNeedRead = true;
         }
 
@@ -1554,7 +1556,7 @@ export class WebGPURenderer {
                 this._starStagingBuf.unmap();
                 const positions = new Float32Array(raw, 0, starSample * 2);
                 const metaU32 = new Uint32Array(raw, STAR_STATS_SAMPLE * 8, starSample * 2);
-                const counters = new Uint32Array(raw, STAR_STATS_SAMPLE * 16, 4);
+                const counters = new Uint32Array(raw, STAR_STATS_SAMPLE * 16, 5);
                 this._computeStarStats(positions, numStars, metaU32, counters);
                 this._starStatsMapping = false;
             }).catch(() => { this._starStatsMapping = false; });
@@ -1598,8 +1600,9 @@ export class WebGPURenderer {
             deaths: counters ? counters[1] : null,
             // merged survivor counts per eye (drawIndirect vertexCount / 6);
             // in stereo each should hover at ~numStars (merged-view uniformity)
-            mergedL: counters ? Math.floor(counters[2] / 6) : null,
-            mergedR: counters ? Math.floor(counters[3] / 6) : null,
+            mergedL: counters ? counters[2] : null,
+            mergedR: counters ? counters[3] : null,
+            shared: counters ? counters[4] : null,
             stereoActive: this._stereoActive,
         };
         if (typeof window !== 'undefined') {

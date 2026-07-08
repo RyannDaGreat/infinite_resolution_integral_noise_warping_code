@@ -42,10 +42,15 @@ const check = (label, s) => {
     const okL = Math.abs(s.mergedL / n - 1) < MERGE_TOL;
     const okR = Math.abs(s.mergedR / n - 1) < MERGE_TOL;
     const okStream = s.inBoundsFrac === 1 && s.minOverMean > 0.7 && s.maxOverMean < 1.3;
-    if (!(okL && okR && okStream)) failures++;
+    // shared-identity coupling: both eyes should agree on well over half the
+    // stars (Python reference: 93.7% at its settings; loose bound for 3D play)
+    const sharedFrac = s.shared / Math.max(s.mergedL, 1);
+    const okShared = sharedFrac > 0.5;
+    if (!(okL && okR && okStream && okShared)) failures++;
     console.log(`${label}: mergedL/N=${(s.mergedL / n).toFixed(3)} mergedR/N=${(s.mergedR / n).toFixed(3)}`
-        + ` streamL uniformity ${s.minOverMean.toFixed(2)}/${s.maxOverMean.toFixed(2)}`
-        + `  ${okL && okR && okStream ? 'PASS' : 'FAIL'}`);
+        + ` shared=${(sharedFrac * 100).toFixed(1)}%`
+        + ` streamL ${s.minOverMean.toFixed(2)}/${s.maxOverMean.toFixed(2)}`
+        + `  ${okL && okR && okStream && okShared ? 'PASS' : 'FAIL'}`);
 };
 
 for (const [mode, name] of [[1, 'sbs-crossed'], [2, 'sbs-parallel'], [3, 'blend'], [4, 'red-blue']]) {
@@ -73,6 +78,14 @@ for (const ipd of [0, 0.5]) {
     await sleep(2 * STATS_TICK_MS);
     check(`stereo red-blue IPD=${ipd}`, await stats());
 }
+
+// Cull Orphans toggle: survivor counts are pre-filter, so stats must hold,
+// and the render path must stay clean while orphans are hidden.
+await page.click('#cullOrphansBtn');
+await sleep(2 * STATS_TICK_MS);
+check('red-blue + Cull Orphans', await stats());
+if (SHOT_DIR) await page.screenshot({ path: `${SHOT_DIR}/stereo_cull_orphans.png` });
+await page.click('#cullOrphansBtn');
 
 // back to OFF: mono must still be healthy
 await page.click('#stereoBtn');
