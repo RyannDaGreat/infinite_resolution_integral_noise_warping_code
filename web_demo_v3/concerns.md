@@ -359,3 +359,5 @@
 - test_fullscreen.mjs added (permanent): res tracking, non-square uniformity,
   stereo+depth+tints in fullscreen (98.5% shared), preset restore. All suites
   green.
+- Added a hover ⓘ next to the depth slider (user request): full why/what/how +
+  the divergence caution ("slide until the sky looks far, then stop").
