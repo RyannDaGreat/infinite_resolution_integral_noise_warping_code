@@ -9,7 +9,7 @@ const MODE_NAMES = ['noise', 'scene', 'scene+noise', 'dither', 'motion', 'raw', 
 const ROUND_MODES = ['None', 'All', '>1'];
 const SHADOW_RES_OPTIONS = [512, 1024, 2048, 4096, 8192, 16384];
 const STORAGE_KEY = 'iinw_v3_settings';
-const SETTINGS_VERSION = 12;
+const SETTINGS_VERSION = 13;
 
 /**
  * Pure function. Map the log-scale star-count slider [0, 100] to a star count.
@@ -56,10 +56,21 @@ const DEFAULTS = {
     starSizeMax: 8,     // q-size: full width in px of a q~1 star (0..20 slider)
     stereoMode: 0,      // 0 off, 1 SBS crossed, 2 SBS parallel, 3 blend, 4 red-blue
     stereoIpd: 0.12,    // eye baseline, world units
-    stereoSwap: false,  // anaglyph: swap which eye gets red vs blue
+    stereoSwap: true,   // anaglyph: swap eye/tint assignment (user default: ON)
+    anaglyphL: '#ff0000',  // glasses tint fed by the left view (pre-swap)
+    anaglyphR: '#0000ff',
+    depthShift: 0,      // convergence shift in render px (0 = infinity at screen)
     cullOrphans: false, // stereo: hide stars not visible in BOTH eyes
     fovDeg: 70,         // camera field of view (mono + stereo)
 };
+
+/**
+ * Pure. '#rrggbb' -> [r, g, b] floats in 0..1.
+ * hexToRgb('#ff0000') -> [1, 0, 0]
+ */
+function hexToRgb(hex) {
+    return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255);
+}
 
 function loadSettings() {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -112,6 +123,12 @@ export class UIManager {
         this.stereoBtn = document.getElementById('stereoBtn');
         this.stereoSwapBtn = document.getElementById('stereoSwapBtn');
         this.cullOrphansBtn = document.getElementById('cullOrphansBtn');
+        this.anaglyphLInput = document.getElementById('anaglyphLInput');
+        this.anaglyphRInput = document.getElementById('anaglyphRInput');
+        this.fullscreenBtn = document.getElementById('fullscreenBtn');
+        this.depthShiftSlider = document.getElementById('depthShiftSlider');
+        this.depthShiftLabel = document.getElementById('depthShiftLabel');
+        this.fsRes = null;   // {w, h} while fullscreen, else null
         this.stereoIpdSlider = document.getElementById('stereoIpdSlider');
         this.stereoIpdLabel = document.getElementById('stereoIpdLabel');
         this.fovSlider = document.getElementById('fovSlider');
@@ -139,8 +156,10 @@ export class UIManager {
         this.syncUI();
     }
 
-    get W() { return RESOLUTIONS[this.settings.resIdx]; }
-    get H() { return this.W; }
+    // Fullscreen overrides the preset resolution with the CURRENT monitor's
+    // dimensions (re-read at every fullscreen entry — monitors change).
+    get W() { return this.fsRes ? this.fsRes.w : RESOLUTIONS[this.settings.resIdx]; }
+    get H() { return this.fsRes ? this.fsRes.h : RESOLUTIONS[this.settings.resIdx]; }
 
     _persist() { saveSettings(this.settings); }
 
@@ -210,6 +229,11 @@ export class UIManager {
         this.stereoSwapBtn.classList.toggle('on', s.stereoSwap);
         this.cullOrphansBtn.textContent = `Cull Orphans: ${s.cullOrphans ? 'ON' : 'OFF'}`;
         this.cullOrphansBtn.classList.toggle('on', s.cullOrphans);
+        this.anaglyphLInput.value = s.anaglyphL;
+        this.anaglyphRInput.value = s.anaglyphR;
+        this.fullscreenBtn.classList.toggle('on', !!this.fsRes);
+        this.depthShiftSlider.value = s.depthShift;
+        this.depthShiftLabel.textContent = `${s.depthShift}px`;
         this.stereoIpdSlider.value = s.stereoIpd;
         this.stereoIpdLabel.textContent = s.stereoIpd.toFixed(2);
         this.fovSlider.value = s.fovDeg;
@@ -248,6 +272,9 @@ export class UIManager {
         renderer.starSizeMaxPx = s.starSizeMax;
         renderer.stereoSwapEnabled = s.stereoSwap;
         renderer.cullOrphansEnabled = s.cullOrphans;
+        renderer.anaglyphColorL = hexToRgb(s.anaglyphL);
+        renderer.anaglyphColorR = hexToRgb(s.anaglyphR);
+        renderer.stereoDepthShiftPx = s.depthShift;
         // stereo camera params are consumed by main.js each frame (matrix build)
     }
 
@@ -266,8 +293,16 @@ export class UIManager {
         const wMult = sbs ? 2 : 1;
         canvas.width = this.W * wMult;
         canvas.height = this.H;
-        canvas.style.width = (this.W * wMult / dpr) + 'px';
-        canvas.style.height = (this.H / dpr) + 'px';
+        if (this.fsRes) {
+            // Fullscreen: fill the monitor; backing store already matches the
+            // screen (retina-aware), so this is 1:1 device pixels in mono.
+            // KNOWN LIMIT: SBS in fullscreen squeezes 2:1 — free-view windowed.
+            canvas.style.width = '100vw';
+            canvas.style.height = '100vh';
+        } else {
+            canvas.style.width = (this.W * wMult / dpr) + 'px';
+            canvas.style.height = (this.H / dpr) + 'px';
+        }
         canvas.style.imageRendering = s.bilinear ? 'auto' : 'pixelated';
     }
 
@@ -332,6 +367,12 @@ export class UIManager {
         });
         this.stereoSwapBtn.addEventListener('click', () => { s.stereoSwap = !s.stereoSwap; update(); });
         this.cullOrphansBtn.addEventListener('click', () => { s.cullOrphans = !s.cullOrphans; update(); });
+        this.anaglyphLInput.addEventListener('input', () => { s.anaglyphL = this.anaglyphLInput.value; update(); });
+        this.anaglyphRInput.addEventListener('input', () => { s.anaglyphR = this.anaglyphRInput.value; update(); });
+        this.fullscreenBtn.addEventListener('click', () => { this.callbacks.onToggleFullscreen?.(); });
+        this.depthShiftSlider.addEventListener('input', () => {
+            s.depthShift = parseInt(this.depthShiftSlider.value); update();
+        });
         this.stereoIpdSlider.addEventListener('input', () => {
             s.stereoIpd = parseFloat(this.stereoIpdSlider.value); update();
         });
@@ -391,6 +432,7 @@ export class UIManager {
             if (e.code === 'KeyH') this.threshBtn.click();
             if (e.code === 'KeyO') this.roundBtn.click();
             if (e.code === 'KeyP') this.resBtn.click();
+            if (e.code === 'KeyF') this.fullscreenBtn.click();
             if (e.code === 'KeyR') this.resetSceneBtn.click();
             if (e.code === 'KeyL') this.lockNoiseBtn.click();
             if (e.code === 'KeyM') this.slowMoBtn.click();

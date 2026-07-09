@@ -1191,7 +1191,16 @@ struct DisplayUniforms {
     noiseOpacity:   f32,
     starField:      u32,   // Stars-mode background: 0 off, 1 density E, 2 deficit
     stereoMode:     u32,   // 0 off, 1 SBS crossed, 2 SBS parallel, 3 blend, 4 red-blue
-    stereoSwap:     u32,   // red-blue mode: 1 = swap which eye gets red vs blue
+    stereoSwap:     u32,   // red-blue mode: 1 = swap which eye feeds which tint
+    // Convergence (horizontal image translation): L view shifts left, R view
+    // right by half this each. Parallel cameras put INFINITY at zero disparity
+    // (= screen depth, everything popping out); the shift gives infinity
+    // uncrossed parallax so the scene recedes BEHIND the screen. One slider
+    // absorbs eye spacing / monitor size / viewing distance.
+    depthShiftPx:   f32,
+    _padB:          u32,
+    anaglyphL:      vec4f, // glasses filter tint fed by the LEFT view (pre-swap)
+    anaglyphR:      vec4f, // glasses filter tint fed by the RIGHT view (pre-swap)
 }
 @group(0) @binding(3) var<uniform> disp: DisplayUniforms;
 
@@ -1251,6 +1260,17 @@ fn applyThreshold(color: vec4f) -> vec4f {
 
 fn luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.299, 0.587, 0.114));
+}
+
+// Eye-view fetch with the stereo convergence shift: view 0 = left (content
+// moves left => sample at +shift), view 1 = right (sample at -shift).
+// Out-of-range columns are void (black) — the screen edge of the shift.
+fn eyeFetch(view: u32, x: i32, y: u32) -> vec4f {
+    let half = disp.depthShiftPx * 0.5;
+    let sx = x + i32(round(select(-half, half, view == 0u)));
+    if (sx < 0 || sx >= i32(disp.W)) { return vec4f(0.0); }
+    if (view == 0u) { return textureLoad(starTex, vec2u(u32(sx), y), 0); }
+    return textureLoad(starTexR, vec2u(u32(sx), y), 0);
 }
 
 @fragment fn fs(in: VsOut) -> @location(0) vec4f {
@@ -1332,20 +1352,22 @@ fn luminance(c: vec3f) -> f32 {
                 rgb = vec3f(0.0, 1.0, 0.0);
             } else {
                 let useRightEye = select(rightHalf, !rightHalf, disp.stereoMode == 1u);
-                let s = select(textureLoad(starTex,  vec2u(u, row), 0),
-                               textureLoad(starTexR, vec2u(u, row), 0), useRightEye);
+                let s = eyeFetch(select(0u, 1u, useRightEye), i32(u), row);
                 rgb = clamp(s.rgb, vec3f(0.0), vec3f(1.0));
             }
         } else {
-            let sL = clamp(textureLoad(starTex,  vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));
-            let sR = clamp(textureLoad(starTexR, vec2u(col, row), 0).rgb, vec3f(0.0), vec3f(1.0));
+            let sL = clamp(eyeFetch(0u, i32(col), row).rgb, vec3f(0.0), vec3f(1.0));
+            let sR = clamp(eyeFetch(1u, i32(col), row).rgb, vec3f(0.0), vec3f(1.0));
             if (disp.stereoMode == 3u) {
                 rgb = 0.5 * (sL + sR);                   // 50% blend
             } else {
-                // red-blue glasses: red eye gets red channel, blue eye blue.
-                // Swap flips the assignment for glasses worn the other way.
-                rgb = select(vec3f(sL.r, 0.0, sR.b),
-                             vec3f(sR.r, 0.0, sL.b), disp.stereoSwap == 1u);
+                // Anaglyph with per-glasses tint colors (defaults: pure red +
+                // pure blue): each view's luminance is rendered in its filter's
+                // color; swap flips which eye feeds which tint.
+                let lums = select(vec2f(luminance(sL), luminance(sR)),
+                                  vec2f(luminance(sR), luminance(sL)),
+                                  disp.stereoSwap == 1u);
+                rgb = disp.anaglyphL.rgb * lums.x + disp.anaglyphR.rgb * lums.y;
             }
         }
         return vec4f(srgbEncode(rgb.r), srgbEncode(rgb.g), srgbEncode(rgb.b), 1.0);

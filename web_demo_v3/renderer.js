@@ -194,6 +194,9 @@ export class WebGPURenderer {
         this._stereoActive = false;      // stars mode + stereo enabled this frame
         this.stereoSwapEnabled = false;  // anaglyph: swap which eye is red vs blue
         this.cullOrphansEnabled = false; // stereo: hide stars not visible in BOTH eyes
+        this.anaglyphColorL = [1, 0, 0]; // glasses tint fed by the left view (pre-swap)
+        this.anaglyphColorR = [0, 0, 1];
+        this.stereoDepthShiftPx = 0;     // convergence: recede the scene behind the screen
         this._starStatsMapping = false;
         this.shadowsEnabled = true;
         this.shadowResolution = 4096;
@@ -397,7 +400,7 @@ export class WebGPURenderer {
             size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.displayUniformBuf = device.createBuffer({
-            size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
         this._statsStagingBuf = device.createBuffer({
@@ -1141,7 +1144,7 @@ export class WebGPURenderer {
 
         // Display uniforms
         const displayFlags = (this.greyscaleEnabled ? 1 : 0) | (this.uniformDisplayEnabled ? 2 : 0);
-        const dispBuf = new ArrayBuffer(48);
+        const dispBuf = new ArrayBuffer(96);   // MUST cover every dispU32/dispF32 index below
         const dispU32 = new Uint32Array(dispBuf);
         const dispF32 = new Float32Array(dispBuf);
         dispU32[0] = displayMode;
@@ -1155,6 +1158,9 @@ export class WebGPURenderer {
         dispU32[7] = stereoNow ? 0 : this.starFieldView;  // field bg is mono-only
         dispU32[8] = stereoNow ? stereo.mode : 0;
         dispU32[9] = this.stereoSwapEnabled ? 1 : 0;
+        dispF32[10] = this.stereoDepthShiftPx;  // convergence shift (render px)
+        dispF32.set(this.anaglyphColorL, 12);   // vec4f at byte 48
+        dispF32.set(this.anaglyphColorR, 16);   // vec4f at byte 64
         device.queue.writeBuffer(this.displayUniformBuf, 0, dispBuf);
 
         const encoder = device.createCommandEncoder();

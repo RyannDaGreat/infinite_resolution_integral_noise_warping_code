@@ -53,13 +53,60 @@ async function main() {
         onSlowMo: (on) => { physics.slowMo = on; },
         onSetTime: (targetElapsed) => { startTime = performance.now() - targetElapsed * 1000; },
         onShadowResChange: (res) => { if (renderer) renderer.setShadowResolution(res); },
+        onToggleFullscreen: () => {
+            if (document.fullscreenElement) document.exitFullscreen();
+            else canvas.requestFullscreen();
+        },
+    });
+
+    // --- Fullscreen: render at the CURRENT monitor's resolution -------------
+    // screen.width/height and devicePixelRatio are re-read at EVERY entry (and
+    // on resize while fullscreen): they change when the window moves between
+    // monitors. The noise-warp pipeline allocates ~250 B/pixel, so total pixels
+    // are capped at the 2048² preset's budget by uniform downscale (the canvas
+    // CSS still fills the screen; slight upscale instead of multi-GB buffers).
+    const MAX_RENDER_PIXELS = 2048 * 2048;
+    function fullscreenTargetRes() {
+        const dpr = ui.settings.retina ? (window.devicePixelRatio || 1) : 1;
+        let w = Math.round(window.screen.width * dpr);
+        let h = Math.round(window.screen.height * dpr);
+        if (w * h > MAX_RENDER_PIXELS) {
+            const s = Math.sqrt(MAX_RENDER_PIXELS / (w * h));
+            w = Math.round(w * s); h = Math.round(h * s);
+            console.warn(`[fullscreen] capped to ${w}x${h} (noise buffers ~250 B/px)`);
+        }
+        return { w, h };
+    }
+    let fsApplying = false;
+    async function applyFullscreenState() {
+        if (fsApplying) return;
+        fsApplying = true;
+        try {
+            ui.fsRes = document.fullscreenElement ? fullscreenTargetRes() : null;
+            ui.updateCanvas(canvas);
+            await createRenderer();
+            ui.syncUI();
+        } finally { fsApplying = false; }
+    }
+    document.addEventListener('fullscreenchange', applyFullscreenState);
+    window.addEventListener('resize', () => {
+        // monitor switch / OS scaling change while fullscreen
+        if (!document.fullscreenElement || fsApplying) return;
+        const t = fullscreenTargetRes();
+        if (t.w !== ui.W || t.h !== ui.H) applyFullscreenState();
     });
 
     async function createRenderer() {
-        if (renderer) renderer.destroy();
-        renderer = new WebGPURenderer(canvas, ui.W, ui.H);
-        await renderer.init();
-        ui.applyToRenderer(renderer);
+        // Keep `renderer` null for the whole rebuild: the RAF loop's guard
+        // must skip frames until init() completes (frame() on a not-yet-
+        // initialized renderer crashes the loop — hit via fullscreen toggles).
+        const old = renderer;
+        renderer = null;
+        old?.destroy();
+        const next = new WebGPURenderer(canvas, ui.W, ui.H);
+        await next.init();
+        ui.applyToRenderer(next);
+        renderer = next;
     }
 
     // Initial setup
@@ -76,10 +123,13 @@ async function main() {
     // --- Projection matrix (FOV is a live UI setting) ---
     let proj = mat4.create();
     let lastFov = 0;
+    let lastAspect = 0;
     function refreshProj() {
-        if (ui.fovDeg !== lastFov) {
+        const aspect = ui.W / ui.H;   // non-square in fullscreen
+        if (ui.fovDeg !== lastFov || aspect !== lastAspect) {
             lastFov = ui.fovDeg;
-            mat4.perspective(proj, glMatrix.toRadian(lastFov), 1.0, 0.1, 100000);
+            lastAspect = aspect;
+            mat4.perspective(proj, glMatrix.toRadian(lastFov), aspect, 0.1, 100000);
         }
     }
     refreshProj();

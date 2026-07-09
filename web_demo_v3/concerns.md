@@ -334,3 +334,28 @@
 - Definitive A/B under noise lock, text strip masked: cull ON = 5092 star px
   removed, 0 added (pure subset, ~850 orphans at IPD 0.5); OFF = 0/0 perfect
   revert. Suite green incl. the cull check; mono untouched.
+
+## 2026-07-09: fullscreen + anaglyph tints + convergence depth slider
+
+- Fullscreen [F]: monitor resolution re-detected at every entry + resize-while-
+  fullscreen (user: "we might switch monitors — check every time"; yes, that is
+  a thing: screen.* and devicePixelRatio are per-display). Retina-aware; pixel
+  cap 2048^2 budget (noise buffers ~250 B/px — retina 4K would be multi-GB).
+  Non-square rendering exercised end-to-end for the first time (proj aspect was
+  hardcoded 1.0 — now ui.W/ui.H).
+- BUG FIXED (pre-existing): createRenderer reassigned `renderer` before init()
+  finished, so the RAF loop could call frame() on a device-less instance and
+  kill the loop (TypeError: 'queue' of undefined). Now null during rebuild.
+- Anaglyph: per-glasses tint color pickers (luminance x filter color; defaults
+  pure red/blue); swap default flipped to ON (user). SETTINGS_VERSION 13.
+- Depth slider = stereographer's convergence / horizontal image translation.
+  Science, recorded: parallel cameras put infinity at zero disparity = screen
+  depth (why everything "only pops out"); shifting L/R images apart by s gives
+  infinity uncrossed parallax -> scene recedes; s ~ eye separation in screen px
+  = true infinity. One slider replaces measuring eyes/monitor/distance.
+- Test lessons: headless screen.* is 800x600 regardless of viewport; a
+  fullscreened canvas swallows coordinate clicks (toolbar covered) — drive
+  buttons with DOM el.click() in tests, keyboard in real use.
+- test_fullscreen.mjs added (permanent): res tracking, non-square uniformity,
+  stereo+depth+tints in fullscreen (98.5% shared), preset restore. All suites
+  green.

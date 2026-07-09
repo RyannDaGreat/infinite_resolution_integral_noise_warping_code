@@ -75,6 +75,7 @@
             <button class="modeBtn" data-mode="4" title="[5] Motion">5:Motion</button>
             <button class="modeBtn" data-mode="5" title="[6] Raw">6:Raw</button>
             <button class="modeBtn" data-mode="6" title="[7] Star warp: N points ride the motion field, uniform every frame">7:Stars</button>
+            <button id="fullscreenBtn" title="[F] Fullscreen: render at the current monitor's resolution (retina-aware, re-detected every time)">[F] Full</button>
         </span>
         <span class="sep">|</span>
         <button id="lockNoiseBtn" title="Freeze noise in place — no warp updates">[L] Lock: OFF</button>
@@ -115,6 +116,11 @@
             <button id="stereoBtn" title="Stereo stars: two eye cameras, two independent star streams, merged per eye at render time (report §13). Cycles OFF / SBS crossed (cross your eyes; aspect-correct, letterboxed) / SBS parallel / 50% blend / red-blue anaglyph">stereo: OFF</button>
             <button id="stereoSwapBtn" title="Red-blue mode: swap which eye gets the red vs blue channel — depends on how the glasses are worn">swap R/B: OFF</button>
             <button id="cullOrphansBtn" title="Hide orphan stars — stars visible in only one eye's merged view (kills binocular-rivalry sparkle; only stars both eyes agree on remain)">Cull Orphans: OFF</button>
+            <input type="color" id="anaglyphLInput" value="#ff0000" title="Anaglyph tint fed by the LEFT view (pre-swap) — match it to your glasses' filter" style="width:24px; height:20px; vertical-align:middle; padding:0; border:none;">
+            <input type="color" id="anaglyphRInput" value="#0000ff" title="Anaglyph tint fed by the RIGHT view (pre-swap) — match it to your glasses' filter" style="width:24px; height:20px; vertical-align:middle; padding:0; border:none;">
+            <span style="font-size:11px;">depth:</span>
+            <input type="range" id="depthShiftSlider" min="0" max="300" step="1" value="0" title="Convergence shift: slides the whole scene BEHIND the screen. 0 = infinity sits at the screen (everything pops out). Raise until the sky looks far — this one slider absorbs your eye spacing, monitor size, and viewing distance" style="width:80px; vertical-align:middle; accent-color:#48c;">
+            <span id="depthShiftLabel" style="font-size:11px; min-width:34px; display:inline-block;">0px</span>
             <span style="font-size:11px;">IPD:</span>
             <input type="range" id="stereoIpdSlider" min="0" max="0.5" step="0.01" value="0.12" title="Stereo camera baseline (world units)" style="width:60px; vertical-align:middle; accent-color:#48c;">
             <span id="stereoIpdLabel" style="font-size:11px; min-width:30px; display:inline-block;">0.12</span>
